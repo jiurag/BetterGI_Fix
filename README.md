@@ -90,6 +90,29 @@ dotnet publish .\BetterGenshinImpact\BetterGenshinImpact.csproj `
 
 更完整的编译说明见 [`BetterGenshinImpact/README.md`](./BetterGenshinImpact/README.md)。
 
+## 自动发布
+
+`.github/workflows/publish.yml` 支持两种发布方式：
+
+- 手动运行工作流：完成构建后，按 `create-release` 输入决定是否创建草稿 Release。
+- 推送 `v*.*.*` 标签：自动构建主程序、便携 ZIP、安装器和 SHA-256 文件，并直接发布正式 Release。
+
+发布新版本时，建议先让项目版本与标签保持一致：
+
+1. 修改 `BetterGenshinImpact/BetterGenshinImpact.csproj` 中的 `<Version>`。
+2. 提交并推送 `main`。
+3. 创建并推送版本标签，例如 `v0.66.3-alpha.3`。
+
+本仓库的 `origin` 可能仍指向上游仓库，推送时应明确指定 BetterGI_Fix：
+
+```powershell
+git push https://github.com/jiurag/BetterGI_Fix.git main
+git tag v0.66.3-alpha.3
+git push https://github.com/jiurag/BetterGI_Fix.git v0.66.3-alpha.3
+```
+
+标签构建不会自动把版本号提交回 `main`，因此应在推送标签前完成版本号提交。标签名不符合语义版本格式时，工作流会在校验阶段失败，不会发布 Release。
+
 ## 验证范围
 
 本分支的当前发布构建已完成：

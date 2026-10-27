@@ -1,5 +1,5 @@
 name: BetterGI Publish
-run-name: "BetterGI ${{ inputs.version }}"
+run-name: "BetterGI ${{ inputs.version || github.ref_name }}"
 
 on:
   workflow_dispatch:
@@ -26,6 +26,9 @@ on:
         description: '上传到 Steambird'
         required: true
         default: false
+  push:
+    tags:
+      - 'v*.*.*'
 
 jobs:
   # Add validation job to check version format
@@ -101,7 +104,7 @@ jobs:
           $version = '${{ needs.validate.outputs.version }}'
           (Get-Content BetterGenshinImpact/BetterGenshinImpact.csproj) -replace '<Version>.*</Version>', "<Version>$version</Version>" | Set-Content BetterGenshinImpact/BetterGenshinImpact.csproj
       - name: 自动提交更改
-        if: github.repository_owner == 'jiurag'
+        if: github.repository_owner == 'jiurag' && github.event_name == 'workflow_dispatch'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update version to ${{ needs.validate.outputs.version }}"
@@ -161,7 +164,7 @@ jobs:
       #       }
       # 生成更新器
       - name: 📥 Download kachina-builder release
-        if: ${{ github.event.inputs.kachina-channel == 'release' }}
+        if: ${{ github.event_name == 'push' || github.event.inputs.kachina-channel == 'release' }}
         uses: robinraju/release-downloader@v1.8
         with:
           repository: "YuehaiTeam/kachina-installer"
@@ -169,7 +172,7 @@ jobs:
           fileName: "kachina-builder.exe"
           
       - name: 📥 Download kachina-builder dev
-        if: ${{ github.event.inputs.kachina-channel == 'dev' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.kachina-channel == 'dev' }}
         uses: dawidd6/action-download-artifact@v8
         with:
           github_token: ${{secrets.GITHUB_TOKEN}}
@@ -217,14 +220,14 @@ jobs:
           cd dist
           7z x "BetterGI_v${{ needs.validate.outputs.version }}.7z"
       - name: 📥 Download kachina-builder release
-        if: ${{ github.event.inputs.kachina-channel == 'release' }}
+        if: ${{ github.event_name == 'push' || github.event.inputs.kachina-channel == 'release' }}
         uses: robinraju/release-downloader@v1.8
         with:
           repository: "YuehaiTeam/kachina-installer"
           latest: true
           fileName: "kachina-builder.exe"
       - name: 📥 Download kachina-builder dev
-        if: ${{ github.event.inputs.kachina-channel == 'dev' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.kachina-channel == 'dev' }}
         uses: dawidd6/action-download-artifact@v8
         with:
           github_token: ${{secrets.GITHUB_TOKEN}}
@@ -289,9 +292,9 @@ jobs:
           name: BetterGI_Setup
           path: BetterGI_Setup*.exe
 
-  # 创建 GitHub Release
+  # 标签推送直接发布；手动运行按输入创建草稿
   create_release:
-    if: github.event.inputs.create-release == 'true'
+    if: github.event_name == 'push' || github.event.inputs.create-release == 'true'
     needs: [validate, build_dist, build_installer]
     runs-on: ubuntu-latest
     permissions:
@@ -306,7 +309,7 @@ jobs:
         with:
           tag_name: v${{ needs.validate.outputs.version }}
           name: BetterGI v${{ needs.validate.outputs.version }}
-          draft: true
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
           prerelease: ${{ github.repository_owner == 'babalae' && contains(needs.validate.outputs.version, '-') }}
           fail_on_unmatched_files: true
           files: |
@@ -327,14 +330,14 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: 📥 Download kachina-builder release
-        if: ${{ github.event.inputs.kachina-channel == 'release' }}
+        if: ${{ github.event_name == 'push' || github.event.inputs.kachina-channel == 'release' }}
         uses: robinraju/release-downloader@v1.8
         with:
           repository: "YuehaiTeam/kachina-installer"
           latest: true
           fileName: "kachina-builder.exe"
       - name: 📥 Download kachina-builder dev
-        if: ${{ github.event.inputs.kachina-channel == 'dev' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.kachina-channel == 'dev' }}
         uses: dawidd6/action-download-artifact@v8
         with:
           github_token: ${{secrets.GITHUB_TOKEN}}
