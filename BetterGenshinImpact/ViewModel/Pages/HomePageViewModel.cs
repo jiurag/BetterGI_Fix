@@ -15,6 +15,7 @@ using BetterGenshinImpact.Helpers.Ui;
 using BetterGenshinImpact.Model;
 using BetterGenshinImpact.Service;
 using BetterGenshinImpact.Service.ChildSession;
+using BetterGenshinImpact.Service.I18n;
 using BetterGenshinImpact.Service.Instance;
 using BetterGenshinImpact.Service.Interface;
 using BetterGenshinImpact.View;
@@ -35,6 +36,7 @@ using System;
 using System.Collections.Frozen;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -116,6 +118,24 @@ public partial class HomePageViewModel : ViewModel, IDisposable
 
     public AllConfig Config { get; set; }
 
+    /// <summary>
+    /// 帧率输入框当前显示文本，允许暂时包含非法输入
+    /// </summary>
+    [ObservableProperty]
+    private string _fpsUnlockTargetText = string.Empty;
+
+    /// <summary>
+    /// 帧率输入校验错误；为空时不显示错误提示
+    /// </summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasFpsUnlockInputError))]
+    private string _fpsUnlockValidationMessage = string.Empty;
+
+    /// <summary>
+    /// 是否显示帧率输入校验错误
+    /// </summary>
+    public bool HasFpsUnlockInputError => !string.IsNullOrEmpty(FpsUnlockValidationMessage);
+
     public bool IsChildSessionEntryVisible => InstanceBootstrap.Current.Context.IsRoot;
 
     private readonly IMaskWindowHost _maskWindowHost;
@@ -182,6 +202,7 @@ public partial class HomePageViewModel : ViewModel, IDisposable
         _childSessionService = childSessionService;
         _bannerImageService = bannerImageService;
         Config = configService.Get();
+        FpsUnlockTargetText = Config.GenshinStartConfig.FpsUnlockTarget.ToString(CultureInfo.InvariantCulture);
         // 本地原神的安装目录与网页版无关，网页版实例不去读注册表，也不写共享配置
         if (!InstanceBootstrap.Current.Context.IsWebView)
         {
@@ -232,6 +253,43 @@ public partial class HomePageViewModel : ViewModel, IDisposable
                 }
             }
         });
+    }
+
+    /// <summary>
+    /// 输入变化时立即校验；只有合法整数才覆盖已保存的目标帧率
+    /// </summary>
+    /// <param name="value">输入框中的新文本</param>
+    partial void OnFpsUnlockTargetTextChanged(string value)
+    {
+        var isValid = int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var target)
+                      && GenshinStartConfig.IsValidFpsUnlockTarget(target);
+        Config.GenshinStartConfig.IsFpsUnlockTargetInputValid = isValid;
+        if (!isValid)
+        {
+            FpsUnlockValidationMessage = I18nService.Instance.Translate("请输入 30 到 240 之间的整数帧率");
+            return;
+        }
+
+        FpsUnlockValidationMessage = string.Empty;
+        Config.GenshinStartConfig.FpsUnlockTarget = target;
+    }
+
+    /// <summary>
+    /// 将目标帧率设为 90
+    /// </summary>
+    [RelayCommand]
+    private void SetFpsUnlock90()
+    {
+        FpsUnlockTargetText = "90";
+    }
+
+    /// <summary>
+    /// 将目标帧率设为 120
+    /// </summary>
+    [RelayCommand]
+    private void SetFpsUnlock120()
+    {
+        FpsUnlockTargetText = "120";
     }
 
     private bool _autoRun = true;

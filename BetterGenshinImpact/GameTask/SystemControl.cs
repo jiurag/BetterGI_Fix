@@ -13,10 +13,11 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Windows.Interop;
 using Vanara.PInvoke;
 
 namespace BetterGenshinImpact.GameTask;
@@ -24,13 +25,7 @@ namespace BetterGenshinImpact.GameTask;
 public class SystemControl
 {
     private static readonly ILogger Logger = App.GetLogger<SystemControl>();
-
-    private const string ChildSessionGenshinStartArgs =
-        "-popupwindow -screen-width 1920 -screen-height 1080";
-
-    private static readonly Regex ChildSessionOverriddenArgumentRegex = new(
-        @"(?<!\S)(?:-popupwindow|-screen-(?:width|height)(?:\s*=\s*(?:""[^""]*""|\S+)|\s+(?:""[^""]*""|(?!-)\S+))?)(?=\s|$)",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly TimeSpan BorderlessWindowPlacementRetryDelay = TimeSpan.FromMilliseconds(300);
 
     /// <summary>
     /// 配置根。SystemControl 是静态的 Win32 函数集合，没有创建方可以传参，暂时读静态入口（见 task-context-removal.md 第 5 节）
@@ -252,9 +247,37 @@ public class SystemControl
 
         var cfg = Config.GenshinStartConfig;
         var workdir = Path.GetDirectoryName(path) ?? "";
-        var arg = BuildGenshinStartArguments(
+        var isChildSession =
+            InstanceBootstrap.Current.Context.InstanceType == BetterGiInstanceType.ChildSession;
+        var monitorBounds = default(GenshinMonitorBounds);
+        var hasMonitorBounds = false;
+        if (cfg.BorderlessFullscreenEnabled && !isChildSession
+            && !TryGetBetterGiMonitorBounds(out monitorBounds, out var monitorError))
+        {
+            Logger.LogWarning("全屏无边框参数未注入：{Reason}", monitorError);
+        }
+        else
+        {
+            hasMonitorBounds = cfg.BorderlessFullscreenEnabled && !isChildSession;
+        }
+
+        var startArguments = GenshinStartArgumentsBuilder.Build(
             cfg.GenshinStartArgs,
-            InstanceBootstrap.Current.Context.InstanceType == BetterGiInstanceType.ChildSession);
+            isChildSession,
+            cfg.BorderlessFullscreenEnabled,
+            monitorBounds.Width,
+            monitorBounds.Height);
+        var arg = startArguments.Arguments;
+        Logger.LogInformation(
+            "原神启动参数已构建：全屏窗口化={BorderlessFullscreenEnabled}，子会话={IsChildSession}，显示器=({MonitorLeft},{MonitorTop}) {MonitorWidth}x{MonitorHeight}，实际窗口模式={AppliedMode}，最终参数={Arguments}",
+            cfg.BorderlessFullscreenEnabled,
+            isChildSession,
+            monitorBounds.Left,
+            monitorBounds.Top,
+            monitorBounds.Width,
+            monitorBounds.Height,
+            startArguments.AppliedMode,
+            arg);
 
         if (cfg.StartGameWithCmd)
         {
@@ -285,6 +308,12 @@ public class SystemControl
                 await Task.Delay(2333);
                 handle = FindGenshinImpactHandle();
                 await Task.Delay(2577);
+                if (startArguments.AppliedMode == GenshinStartWindowMode.FullscreenWindowed
+                    && hasMonitorBounds)
+                {
+                    TryPlaceBorderlessGameWindow(handle, monitorBounds);
+                }
+
                 return handle;
             }
 
@@ -294,21 +323,135 @@ public class SystemControl
         return FindGenshinImpactHandle();
     }
 
-    internal static string BuildGenshinStartArguments(string? configuredArguments, bool isChildSession)
+    /// <summary>
+    /// 获取 BetterGI 主窗口所在显示器的完整矩形，不扣除任务栏。
+    /// </summary>
+    internal static bool TryGetBetterGiMonitorBounds(
+        out GenshinMonitorBounds bounds,
+        out string? failureReason)
     {
-        var arguments = configuredArguments?.Trim() ?? string.Empty;
-        if (!isChildSession)
-        {
-            return arguments;
-        }
+        bounds = default;
+        failureReason = null;
 
-        arguments = ChildSessionOverriddenArgumentRegex.Replace(arguments, string.Empty).Trim();
-        return string.IsNullOrEmpty(arguments)
-            ? ChildSessionGenshinStartArgs
-            : $"{arguments} {ChildSessionGenshinStartArgs}";
+        try
+        {
+            var mainWindow = UIDispatcherHelper.MainWindow;
+            var handle = new WindowInteropHelper(mainWindow).Handle;
+            if (handle == 0)
+            {
+                failureReason = "BetterGI 主窗口句柄无效";
+                return false;
+            }
+
+            var monitor = User32.MonitorFromWindow(
+                handle,
+                User32.MonitorFlags.MONITOR_DEFAULTTONEAREST);
+            if (monitor.IsNull)
+            {
+                failureReason = "无法找到 BetterGI 主窗口所在显示器";
+                return false;
+            }
+
+            var monitorInfo = User32.MONITORINFO.Default;
+            if (!User32.GetMonitorInfo(monitor, ref monitorInfo))
+            {
+                failureReason = $"读取显示器信息失败，Win32 错误码 {Marshal.GetLastWin32Error()}";
+                return false;
+            }
+
+            var monitorRect = monitorInfo.rcMonitor;
+            if (monitorRect.Width <= 0 || monitorRect.Height <= 0)
+            {
+                failureReason = $"显示器尺寸无效：{monitorRect.Width}x{monitorRect.Height}";
+                return false;
+            }
+
+            bounds = new GenshinMonitorBounds(
+                monitorRect.Left,
+                monitorRect.Top,
+                monitorRect.Width,
+                monitorRect.Height);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            failureReason = $"读取 BetterGI 主窗口所在显示器时发生异常：{ex.Message}";
+            return false;
+        }
     }
 
-    
+    /// <summary>
+    /// 将普通 popup 窗口铺满目标显示器；失败只记录日志，不中断游戏启动。
+    /// </summary>
+    private static bool TryPlaceBorderlessGameWindow(nint handle, GenshinMonitorBounds bounds)
+    {
+        if (handle == 0)
+        {
+            Logger.LogWarning("全屏无边框窗口定位失败：未找到原神窗口句柄");
+            return false;
+        }
+
+        try
+        {
+            const int placementAttempts = 3;
+            for (var attempt = 1; attempt <= placementAttempts; attempt++)
+            {
+                if (!User32.SetWindowPos(
+                        handle,
+                        default,
+                        bounds.Left,
+                        bounds.Top,
+                        bounds.Width,
+                        bounds.Height,
+                        User32.SetWindowPosFlags.SWP_NOZORDER | User32.SetWindowPosFlags.SWP_NOACTIVATE))
+                {
+                    Logger.LogWarning(
+                        "全屏无边框窗口定位失败：第 {Attempt} 次调用 SetWindowPos 失败，Win32 错误码 {Error}",
+                        attempt,
+                        Marshal.GetLastWin32Error());
+                    Thread.Sleep(BorderlessWindowPlacementRetryDelay);
+                    continue;
+                }
+
+                if (User32.GetWindowRect(handle, out var actualBounds)
+                    && actualBounds.Left == bounds.Left
+                    && actualBounds.Top == bounds.Top
+                    && actualBounds.Width == bounds.Width
+                    && actualBounds.Height == bounds.Height)
+                {
+                    Logger.LogInformation(
+                        "全屏无边框窗口已定位：({Left},{Top}) {Width}x{Height}，窗口句柄={Handle}",
+                        bounds.Left,
+                        bounds.Top,
+                        bounds.Width,
+                        bounds.Height,
+                        handle);
+                    return true;
+                }
+
+                Thread.Sleep(BorderlessWindowPlacementRetryDelay);
+            }
+
+            User32.GetWindowRect(handle, out var finalBounds);
+            Logger.LogWarning(
+                "全屏无边框窗口定位未达到目标：目标=({TargetLeft},{TargetTop}) {TargetWidth}x{TargetHeight}，实际=({ActualLeft},{ActualTop}) {ActualWidth}x{ActualHeight}",
+                bounds.Left,
+                bounds.Top,
+                bounds.Width,
+                bounds.Height,
+                finalBounds.Left,
+                finalBounds.Top,
+                finalBounds.Width,
+                finalBounds.Height);
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "全屏无边框窗口定位异常");
+            return false;
+        }
+    }
+
     public static string GetActiveByProcess()
     {
         return GetActiveProcessName() ?? "Unknown";

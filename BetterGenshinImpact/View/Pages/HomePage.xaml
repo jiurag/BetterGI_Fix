@@ -576,6 +576,91 @@
                     <ui:TextBlock Grid.Row="0"
                                   Grid.Column="0"
                                   FontTypography="Body"
+                                  Text="{i18n:T 启动时全屏窗口化}"
+                                  TextWrapping="Wrap" />
+                    <ui:TextBlock Grid.Row="1"
+                                  Grid.Column="0"
+                                  Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
+                                  Text="{i18n:T 切换应用不会最小化；窗口铺满 BetterGI 所在显示器。}"
+                                  TextWrapping="Wrap" />
+                    <ui:ToggleSwitch Grid.Row="0"
+                                     Grid.RowSpan="2"
+                                     Grid.Column="1"
+                                     Margin="0,0,36,0"
+                                     VerticalAlignment="Center"
+                                     IsChecked="{Binding Config.GenshinStartConfig.BorderlessFullscreenEnabled, Mode=TwoWay}" />
+                </Grid>
+                <Separator Margin="-18,0" BorderThickness="0,1,0,0" />
+                <Grid Margin="16">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <ui:TextBlock Grid.Row="0"
+                                  Grid.Column="0"
+                                  FontTypography="Body"
+                                  Text="{i18n:T 启动时解锁帧率}"
+                                  TextWrapping="Wrap" />
+                    <ui:TextBlock Grid.Row="1"
+                                  Grid.Column="0"
+                                  Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
+                                  Text="{i18n:T 仅当原神由 BetterGI 启动时生效；使用前请自行评估账号风险。}"
+                                  TextWrapping="Wrap" />
+                    <ui:TextBlock Grid.Row="2"
+                                  Grid.Column="0"
+                                  Margin="0,4,0,0"
+                                  Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
+                                  Text="{i18n:T 支持 30 到 240 的整数帧率，实际帧率还可能受显示器、垂直同步和游戏限制。}"
+                                  TextWrapping="Wrap" />
+                    <StackPanel Grid.Row="3"
+                                Grid.Column="0"
+                                Margin="0,8,0,0"
+                                Orientation="Horizontal">
+                        <ui:TextBox Width="96"
+                                    VerticalAlignment="Center"
+                                    Text="{Binding FpsUnlockTargetText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+                        <ui:TextBlock Margin="8,0,12,0"
+                                      VerticalAlignment="Center"
+                                      Text="{i18n:T FPS}" />
+                        <ui:Button Margin="0,0,8,0"
+                                   Command="{Binding SetFpsUnlock90Command, Mode=OneWay}"
+                                   Content="{i18n:T 90 帧}" />
+                        <ui:Button Command="{Binding SetFpsUnlock120Command, Mode=OneWay}"
+                                   Content="{i18n:T 120 帧}" />
+                    </StackPanel>
+                    <ui:TextBlock Grid.Row="4"
+                                  Grid.Column="0"
+                                  Margin="0,6,0,0"
+                                  Foreground="{DynamicResource SystemFillColorCriticalBrush}"
+                                  Text="{Binding FpsUnlockValidationMessage, Mode=OneWay}"
+                                  TextWrapping="Wrap"
+                                  Visibility="{Binding HasFpsUnlockInputError, Mode=OneWay, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                    <ui:ToggleSwitch Grid.Row="0"
+                                     Grid.RowSpan="3"
+                                     Grid.Column="1"
+                                     Margin="0,0,36,0"
+                                     IsChecked="{Binding Config.GenshinStartConfig.FpsUnlockEnabled, Mode=TwoWay}" />
+                </Grid>
+                <Separator Margin="-18,0" BorderThickness="0,1,0,0" />
+                <Grid Margin="16">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <ui:TextBlock Grid.Row="0"
+                                  Grid.Column="0"
+                                  FontTypography="Body"
                                   Text="{i18n:T 使用 CMD 启动游戏}"
                                   TextWrapping="Wrap" />
                     <ui:TextBlock Grid.Row="1"

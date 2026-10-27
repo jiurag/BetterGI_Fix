@@ -287,6 +287,14 @@
 	  <_DeploymentManifestIconFile Remove="Resources\Images\logo.ico" />
 	</ItemGroup>
 
+	<ItemGroup>
+		<None Update="GameTask\Runtime\Win32\Hook\GenshinFpsUnlockHook.dll">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+			<TargetPath>GenshinFpsUnlockHook.dll</TargetPath>
+		</None>
+	</ItemGroup>
+
 	<!--
 		Melanchall.DryWetMidi 的 build\Melanchall.DryWetMidi.targets 会无条件把 x86/x64/macOS
 		三份本地库都复制到输出目录（它没有使用 runtimes/{rid}/native 结构，不感知 RID）。

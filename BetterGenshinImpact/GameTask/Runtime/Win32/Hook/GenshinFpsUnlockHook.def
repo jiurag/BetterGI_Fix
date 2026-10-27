@@ -1,0 +1,3 @@
+LIBRARY GenshinFpsUnlockHook
+EXPORTS
+    GenshinFpsUnlockHookProc

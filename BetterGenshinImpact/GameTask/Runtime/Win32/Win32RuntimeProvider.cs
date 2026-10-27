@@ -19,6 +19,7 @@ public sealed class Win32RuntimeProvider(
     IConfigService configService,
     IMaskWindowDrawingBoard maskWindowDrawingBoard,
     IMaskWindowMapState maskWindowMapState,
+    GenshinFpsUnlockService genshinFpsUnlockService,
     ILogger<Win32RuntimeProvider> logger)
     : IGameRuntimeProvider
 {
@@ -32,6 +33,7 @@ public sealed class Win32RuntimeProvider(
         var config = configService.Get();
         DisableGenshinHdrIfNeeded(config);
 
+        var startedByBetterGi = false;
         var hWnd = SystemControl.FindGenshinImpactHandle();
         if (hWnd == IntPtr.Zero)
         {
@@ -50,6 +52,8 @@ public sealed class Win32RuntimeProvider(
                     // 启动失败的提示已由 StartFromLocalAsync 给出
                     return null;
                 }
+
+                startedByBetterGi = true;
             }
 
             if (hWnd == IntPtr.Zero)
@@ -60,7 +64,23 @@ public sealed class Win32RuntimeProvider(
         }
 
         ct.ThrowIfCancellationRequested();
-        return AttachTo(hWnd);
+        var runtime = AttachTo(hWnd);
+        if (startedByBetterGi)
+        {
+            try
+            {
+                genshinFpsUnlockService.TryStart(
+                    runtime.Window.ProcessId,
+                    runtime.Window.Handle);
+            }
+            catch (Exception exception)
+            {
+                // 帧率解锁属于附加能力，任何异常都不能影响原神和截图器正常运行。
+                logger.LogWarning(exception, "启动原神帧率解锁失败，已继续正常运行环境");
+            }
+        }
+
+        return runtime;
     }
 
     /// <summary>

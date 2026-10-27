@@ -272,6 +272,7 @@ public partial class App : Application
                 services.AddSingleton<TaskStopService>();
                 services.AddSingleton<WindowsNotificationSuppressionService>();
                 // 游戏运行环境：按实例类型选定 Provider，见 Docs/design/game-runtime.md
+                services.AddSingleton<GenshinFpsUnlockService>();
                 services.AddSingleton<Win32RuntimeProvider>();
                 services.AddSingleton<IGameRuntimeProvider>(sp => sp.GetRequiredService<Win32RuntimeProvider>());
                 services.AddSingleton<WebPageRuntimeProvider>();
