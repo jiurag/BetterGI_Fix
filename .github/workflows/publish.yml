@@ -65,7 +65,7 @@ jobs:
           path: dist/
 
   build_kachina_builder:
-    runs-on: windows-latest
+    runs-on: windows-2022
     needs: [validate]
     steps:
       - uses: actions/checkout@v4
@@ -99,10 +99,17 @@ jobs:
           cache: pnpm
           cache-dependency-path: kachina/pnpm-lock.yaml
       - name: Build patched Kachina builder
+        shell: pwsh
         working-directory: kachina
         run: |
           pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) {
+            throw "pnpm install failed with exit code $LASTEXITCODE"
+          }
           pnpm build
+          if ($LASTEXITCODE -ne 0) {
+            throw "pnpm build failed with exit code $LASTEXITCODE"
+          }
           $rel = "target\x86_64-win7-windows-msvc\release"
           $bundle = Join-Path $rel "kachina-builder-bundle.exe"
           $builder = Join-Path $rel "kachina-builder.exe"
