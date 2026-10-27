@@ -1442,6 +1442,10 @@
   "请输入 30 到 240 之间的整数帧率": "Enter a whole-number FPS from 30 to 240",
   "帧率解锁失败：{0}\n\n原神仍会正常运行。": "FPS unlock failed: {0}\n\nGenshin Impact will continue to run normally.",
   "BetterGI 帧率解锁": "BetterGI FPS Unlock",
+  "桌面与开始菜单": "Desktop and Start Menu",
+  "便携版可在这里创建快捷方式；安装版通常已经自动创建": "Portable builds can create shortcuts here; installed builds usually create them automatically",
+  "桌面快捷方式": "Desktop shortcut",
+  "开始菜单入口": "Start menu entry",
   "（测试）播放内存中的路径": "(Test) Play In-Memory Path",
   "（测试）测试": "(Test) Test",
   "（测试）测试2": "(Test) Test 2"

@@ -61,6 +61,11 @@ public partial class CommonSettingsPageViewModel : ViewModel
     /// </summary>
     private readonly ExternalAccessTokenService _externalAccessTokenService;
 
+    /// <summary>
+    /// 桌面和开始菜单快捷方式管理服务。
+    /// </summary>
+    private readonly ShellShortcutService _shellShortcutService;
+
     private readonly TpConfig _tpConfig;
 
     private string _selectedArea = string.Empty;
@@ -100,6 +105,9 @@ public partial class CommonSettingsPageViewModel : ViewModel
         _i18nService = i18nService;
         ExternalAccessState = externalAccessState;
         _externalAccessTokenService = externalAccessTokenService;
+        _shellShortcutService = new ShellShortcutService(
+            Environment.ProcessPath ?? Path.Combine(Global.StartUpPath, "BetterGI.exe"),
+            Global.StartUpPath);
         Config.ExternalAccessConfig.PropertyChanged += (_, args) =>
         {
             if (args.PropertyName == nameof(ExternalAccessConfig.AccessToken))
@@ -118,6 +126,47 @@ public partial class CommonSettingsPageViewModel : ViewModel
     }
 
     public AllConfig Config { get; set; }
+
+    /// <summary>
+    /// 桌面快捷方式是否存在；切换时立即创建或删除快捷方式。
+    /// </summary>
+    public bool DesktopShortcutEnabled
+    {
+        get => _shellShortcutService.DesktopShortcutExists;
+        set => SetShortcutEnabled(
+            value,
+            () => _shellShortcutService.DesktopShortcutExists,
+            _shellShortcutService.CreateDesktopShortcut,
+            _shellShortcutService.RemoveDesktopShortcut,
+            "桌面快捷方式",
+            nameof(DesktopShortcutEnabled));
+    }
+
+    /// <summary>
+    /// 开始菜单快捷方式是否存在；切换时立即创建或删除快捷方式。
+    /// </summary>
+    public bool StartMenuShortcutEnabled
+    {
+        get => _shellShortcutService.StartMenuShortcutExists;
+        set => SetShortcutEnabled(
+            value,
+            () => _shellShortcutService.StartMenuShortcutExists,
+            _shellShortcutService.CreateStartMenuShortcut,
+            _shellShortcutService.RemoveStartMenuShortcut,
+            "开始菜单快捷方式",
+            nameof(StartMenuShortcutEnabled));
+    }
+
+    /// <summary>
+    /// 桌面快捷方式的实际完整路径。
+    /// </summary>
+    public string DesktopShortcutPath => _shellShortcutService.DesktopShortcutPath;
+
+    /// <summary>
+    /// 开始菜单快捷方式的实际完整路径。
+    /// </summary>
+    public string StartMenuShortcutPath => _shellShortcutService.StartMenuShortcutPath;
+
     public ObservableCollection<OverlayMetricSettingItem> OverlayMetricItems { get; }
     public ObservableCollection<OverlayStyleSettingGroup> OverlayStyleSettingGroups { get; }
     public ObservableCollection<string> CountryList { get; } = new();
@@ -148,6 +197,49 @@ public partial class CommonSettingsPageViewModel : ViewModel
     }
 
     public ObservableCollection<string> MapPathingTypes { get; } = ["SIFT", "TemplateMatch"];
+
+    /// <summary>
+    /// 按开关状态创建或移除快捷方式，失败时回滚界面状态并显示错误。
+    /// </summary>
+    /// <param name="enabled">目标启用状态。</param>
+    /// <param name="isEnabled">读取当前实际状态。</param>
+    /// <param name="create">创建快捷方式。</param>
+    /// <param name="remove">移除快捷方式。</param>
+    /// <param name="displayName">错误提示中的快捷方式名称。</param>
+    /// <param name="propertyName">需要通知界面刷新的属性名。</param>
+    private void SetShortcutEnabled(
+        bool enabled,
+        Func<bool> isEnabled,
+        Action create,
+        Action remove,
+        string displayName,
+        string propertyName)
+    {
+        if (enabled == isEnabled())
+        {
+            return;
+        }
+
+        try
+        {
+            if (enabled)
+            {
+                create();
+            }
+            else
+            {
+                remove();
+            }
+        }
+        catch (Exception ex)
+        {
+            ThemedMessageBox.Error($"无法{(enabled ? "创建" : "移除")}{displayName}：{ex.Message}");
+        }
+        finally
+        {
+            OnPropertyChanged(propertyName);
+        }
+    }
 
     [ObservableProperty] private FrozenDictionary<string, string> _languageDict =
         new[] { "zh-Hans", "zh-Hant", "en", "ja", "ru", "it"  }

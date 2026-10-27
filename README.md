@@ -6,9 +6,9 @@
 > - 本仓库：[`jiurag/BetterGI_Fix`](https://github.com/jiurag/BetterGI_Fix)
 > - 当前发布分支：`main`
 > - 上游项目：[`babalae/better-genshin-impact`](https://github.com/babalae/better-genshin-impact)
-> - 当前预发布版本：[`v0.66.3-alpha.2`](https://github.com/jiurag/BetterGI_Fix/releases/tag/v0.66.3-alpha.2)
+> - 当前预发布版本：[`v0.66.3-alpha.3`](https://github.com/jiurag/BetterGI_Fix/releases/tag/v0.66.3-alpha.3)
 
-BetterGI_Fix 基于 BetterGI 源码维护，保留上游的视觉识别、自动任务和模拟操作能力，并在本分支中增加原神帧率解锁与启动时全屏窗口化。
+BetterGI_Fix 基于 BetterGI 源码维护，保留上游的视觉识别、自动任务和模拟操作能力，并在本分支中增加原神帧率解锁、启动时全屏窗口化以及快捷方式管理。
 
 本仓库中的问题、构建和发布均针对这个分支。上游官方问题请不要提交到这里；只属于官方版本的问题，请前往[上游仓库](https://github.com/babalae/better-genshin-impact)反馈。
 
@@ -34,6 +34,14 @@ BetterGI_Fix 基于 BetterGI 源码维护，保留上游的视觉识别、自动
 
 全屏窗口化只处理启动参数和窗口位置，不修改游戏文件或游戏进程内存。
 
+### 3. 桌面与开始菜单快捷方式
+
+- 在“软件设置”中的“桌面与开始菜单”展开项里提供两个独立开关。
+- 打开开关会创建快捷方式，关闭开关会删除对应快捷方式。
+- 目标是当前正在运行的 `BetterGI.exe`，工作目录和程序图标会自动写入快捷方式。
+- 安装版通常已经由安装器自动创建公共桌面和开始菜单入口；便携版可使用这两个开关手动创建。
+- 关闭开始菜单开关时会删除 `BetterGI.lnk`；BetterGI 开始菜单文件夹为空时也会一并清理。
+
 ## 下载与使用
 
 前往[本分支的 Releases](https://github.com/jiurag/BetterGI_Fix/releases)下载最新预发布资产。
@@ -43,7 +51,8 @@ BetterGI_Fix 基于 BetterGI 源码维护，保留上游的视觉识别、自动
 3. 安装或解压时请选择非系统盘目录，避免占用 C 盘空间。
 4. 打开首页的“原神，启动！”区域。
 5. 按需开启“启动时解锁帧率”和“启动时全屏窗口化”。
-6. 通过 BetterGI 启动原神。
+6. 便携版可以在“软件设置”中按需开启桌面或开始菜单快捷方式。
+7. 通过 BetterGI 启动原神。
 
 发布页同时提供安装器和便携 ZIP。`BetterGI.exe` 与安装器均未进行数字签名，Windows SmartScreen 可能提示“未知发布者”。
 
@@ -101,14 +110,14 @@ dotnet publish .\BetterGenshinImpact\BetterGenshinImpact.csproj `
 
 1. 修改 `BetterGenshinImpact/BetterGenshinImpact.csproj` 中的 `<Version>`。
 2. 提交并推送 `main`。
-3. 创建并推送版本标签，例如 `v0.66.3-alpha.3`。
+3. 创建并推送版本标签，例如 `v0.66.3-alpha.4`。
 
 本仓库的 `origin` 可能仍指向上游仓库，推送时应明确指定 BetterGI_Fix：
 
 ```powershell
 git push https://github.com/jiurag/BetterGI_Fix.git main
-git tag v0.66.3-alpha.3
-git push https://github.com/jiurag/BetterGI_Fix.git v0.66.3-alpha.3
+git tag v0.66.3-alpha.4
+git push https://github.com/jiurag/BetterGI_Fix.git v0.66.3-alpha.4
 ```
 
 标签构建不会自动把版本号提交回 `main`，因此应在推送标签前完成版本号提交。标签名不符合语义版本格式时，工作流会在校验阶段失败，不会发布 Release。
@@ -119,6 +128,7 @@ git push https://github.com/jiurag/BetterGI_Fix.git v0.66.3-alpha.3
 
 - 原生 Hook DLL 和主程序的 x64 Release 构建。
 - 启动参数测试 `12/12` 通过。
+- 桌面和开始菜单快捷方式已完成创建、Windows Shell 反向读取、删除及空目录清理黑盒测试。
 - `en`、`it`、`ja`、`ru` 四个语言 JSON 解析检查。
 - 发布 ZIP 全条目可读取、路径安全检查和 SHA-256 校验。
 
