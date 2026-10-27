@@ -8,14 +8,6 @@ on:
         description: 'BetterGI Version (eg: 0.35.1, 0.36.5-alpha.1)'
         required: true
         type: string
-      kachina-channel:
-        type: choice
-        description: 'Kachina Installer Channel'
-        required: true
-        default: 'release'
-        options:
-          - release
-          - dev
       create-release:
         type: boolean
         description: '创建 GitHub Release 草稿'
@@ -72,6 +64,58 @@ jobs:
           name: web_map_editor
           path: dist/
 
+  build_kachina_builder:
+    runs-on: windows-latest
+    needs: [validate]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: bettergi
+      - name: Checkout pinned Kachina source
+        shell: pwsh
+        run: |
+          git init kachina
+          git -C kachina remote add origin https://github.com/YuehaiTeam/kachina-installer.git
+          git -C kachina fetch --depth=1 origin 05a14107fc024645e1ad350fd3b4dffa62ae1368
+          git -C kachina checkout --detach FETCH_HEAD
+          git -C kachina apply --verbose "$env:GITHUB_WORKSPACE/bettergi/.github/kachina-idm.patch"
+      - name: Install Rust nightly
+        shell: pwsh
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup component add rust-src --toolchain nightly
+          rustup default nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kachina
+          cache-targets: false
+      - uses: pnpm/action-setup@v4.0.0
+        with:
+          version: 10.17.0
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: kachina/pnpm-lock.yaml
+      - name: Build patched Kachina builder
+        working-directory: kachina
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          $rel = "target\x86_64-win7-windows-msvc\release"
+          $bundle = Join-Path $rel "kachina-builder-bundle.exe"
+          $builder = Join-Path $rel "kachina-builder.exe"
+          if ((Get-Item $bundle).Length -le (Get-Item $builder).Length) {
+            throw "merge-release-bundle did not run"
+          }
+          Copy-Item $bundle "../kachina-builder.exe" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KachinaBuilder
+          path: kachina-builder.exe
+          if-no-files-found: error
+
   build_web_scripts_list:
     runs-on: ubuntu-latest
     steps:
@@ -91,7 +135,7 @@ jobs:
   
   build_dist:
     runs-on: windows-latest
-    needs: [validate, build_web_map_editor, build_web_scripts_list]
+    needs: [validate, build_kachina_builder, build_web_map_editor, build_web_scripts_list]
     permissions:
       contents: write
     steps:
@@ -163,25 +207,11 @@ jobs:
       #           }
       #       }
       # 生成更新器
-      - name: 📥 Download kachina-builder release
-        if: ${{ github.event_name == 'push' || github.event.inputs.kachina-channel == 'release' }}
-        uses: robinraju/release-downloader@v1.8
+      - name: Download patched kachina-builder
+        uses: actions/download-artifact@v4
         with:
-          repository: "YuehaiTeam/kachina-installer"
-          latest: true
-          fileName: "kachina-builder.exe"
-          
-      - name: 📥 Download kachina-builder dev
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.kachina-channel == 'dev' }}
-        uses: dawidd6/action-download-artifact@v8
-        with:
-          github_token: ${{secrets.GITHUB_TOKEN}}
-          repo: "YuehaiTeam/kachina-installer"
-          workflow: "build.yml"
-          name: artifact
-          branch: main
-          event: push
-          workflow_conclusion: success
+          name: KachinaBuilder
+          path: .
       - name: 📦 Gen Updater by kachina-builder
         run: |
           cd dist
@@ -219,24 +249,11 @@ jobs:
         run: |
           cd dist
           7z x "BetterGI_v${{ needs.validate.outputs.version }}.7z"
-      - name: 📥 Download kachina-builder release
-        if: ${{ github.event_name == 'push' || github.event.inputs.kachina-channel == 'release' }}
-        uses: robinraju/release-downloader@v1.8
+      - name: Download patched kachina-builder
+        uses: actions/download-artifact@v4
         with:
-          repository: "YuehaiTeam/kachina-installer"
-          latest: true
-          fileName: "kachina-builder.exe"
-      - name: 📥 Download kachina-builder dev
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.kachina-channel == 'dev' }}
-        uses: dawidd6/action-download-artifact@v8
-        with:
-          github_token: ${{secrets.GITHUB_TOKEN}}
-          repo: "YuehaiTeam/kachina-installer"
-          workflow: "build.yml"
-          name: artifact
-          branch: main
-          event: push
-          workflow_conclusion: success
+          name: KachinaBuilder
+          path: .
       - name: 📦 Pack kachina-builder
         run: |
           cd dist
@@ -329,24 +346,11 @@ jobs:
           path: downloads
           github-token: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: 📥 Download kachina-builder release
-        if: ${{ github.event_name == 'push' || github.event.inputs.kachina-channel == 'release' }}
-        uses: robinraju/release-downloader@v1.8
+      - name: Download patched kachina-builder
+        uses: actions/download-artifact@v4
         with:
-          repository: "YuehaiTeam/kachina-installer"
-          latest: true
-          fileName: "kachina-builder.exe"
-      - name: 📥 Download kachina-builder dev
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.kachina-channel == 'dev' }}
-        uses: dawidd6/action-download-artifact@v8
-        with:
-          github_token: ${{secrets.GITHUB_TOKEN}}
-          repo: "YuehaiTeam/kachina-installer"
-          workflow: "build.yml"
-          name: artifact
-          branch: main
-          event: push
-          workflow_conclusion: success
+          name: KachinaBuilder
+          path: .
 
       - name: Embed VCRedist
         shell: bash
