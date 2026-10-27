@@ -60,83 +60,10 @@
                                           TextWrapping="Wrap" />
                         </Grid>
                     </ui:CardControl.Header>
-                    <StackPanel Orientation="Horizontal">
-                        <ComboBox x:Name="GitSourceComboBox"
-                                  SelectedValue="{Binding SelectedGitSource}"
-                                  SelectedValuePath="Content"
-                                  Margin="0,0,8,0"
-                                  MinWidth="80">
-                            <ComboBoxItem Content="Github" />
-                            <ComboBoxItem Content="CNB" />
-                        </ComboBox>
-                        <ui:Button
-                            Icon="{ui:SymbolIcon ArrowDownload24}"
-                            Content="{i18n:T 立即更新}"
-                            Command="{Binding UpdateFromGitHostPlatformCommand}" />
-                    </StackPanel>
-                </ui:CardControl>
-                <ui:CardControl Name="SteambirdCard" Margin="0,0,0,4" Padding="12,12">
-                    <ui:CardControl.Icon>
-                        <ui:FontIcon Glyph="&#xf4ba;" Style="{StaticResource FaFontIconStyle}" />
-                    </ui:CardControl.Icon>
-                    <ui:CardControl.Header>
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
-                            <emoji:TextBlock Grid.Row="0"
-                                             Grid.Column="0"
-                                             Text="{i18n:T Steambird 服务 🆓}"
-                                             TextWrapping="Wrap" />
-                            <ui:TextBlock Grid.Row="1"
-                                          Grid.Column="0"
-                                          Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
-                                          Text="{i18n:T 【国内】普通用户可点此直接更新}"
-                                          TextWrapping="Wrap" />
-                        </Grid>
-                    </ui:CardControl.Header>
-                    <StackPanel Orientation="Horizontal">
-                        <ui:Button
-                            Appearance="Success"
-                            Icon="{ui:SymbolIcon ArrowDownload24}"
-                            Content="{i18n:T 立即更新}"
-                            Command="{Binding UpdateFromSteambirdCommand}" />
-                    </StackPanel>
-                </ui:CardControl>
-                <ui:CardControl Margin="0,0,0,4" Padding="12,12">
-                    <ui:CardControl.Icon>
-                        <ui:FontIcon Glyph="&#xf0c2;" Style="{StaticResource FaFontIconStyle}" />
-                    </ui:CardControl.Icon>
-                    <ui:CardControl.Header>
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                            </Grid.RowDefinitions>
-                            <emoji:TextBlock Grid.Row="0"
-                                          Grid.Column="0"
-                                          Text="{i18n:T Mirror酱服务 💰}"
-                                          TextWrapping="Wrap" />
-                            <ui:TextBlock Grid.Row="1"
-                                          Grid.Column="0"
-                                          Foreground="{ui:ThemeResource TextFillColorTertiaryBrush}"
-                                          Text="{i18n:T 【国内】Mirror酱用户可以输入CDK高速更新}"
-                                          TextWrapping="Wrap" />
-                        </Grid>
-                    </ui:CardControl.Header>
-                    <StackPanel Orientation="Horizontal">
-                        <ui:Button 
-                            Name="EditCdkButton"
-                            Margin="0,0,8,0"
-                            Icon="{ui:SymbolIcon TicketDiagonal24}"
-                            Content="{i18n:T 修改CDK}"
-                            Command="{Binding EditCdkCommand}" />
-                        <ui:Button
-                            Icon="{ui:SymbolIcon ArrowDownload24}"
-                            Content="{i18n:T 立即更新}"
-                            Command="{Binding UpdateFromMirrorChyanCommand}" />
-                    </StackPanel>
+                    <ui:Button
+                        Icon="{ui:SymbolIcon ArrowDownload24}"
+                        Content="{i18n:T 立即更新}"
+                        Command="{Binding UpdateFromGitHostPlatformCommand}" />
                 </ui:CardControl>
                 
                 <!--<ui:CardControl Margin="0,0,0,8">

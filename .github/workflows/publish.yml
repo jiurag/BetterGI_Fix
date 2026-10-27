@@ -89,6 +89,8 @@ jobs:
   build_dist:
     runs-on: windows-latest
     needs: [validate, build_web_map_editor, build_web_scripts_list]
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -99,11 +101,11 @@ jobs:
           $version = '${{ needs.validate.outputs.version }}'
           (Get-Content BetterGenshinImpact/BetterGenshinImpact.csproj) -replace '<Version>.*</Version>', "<Version>$version</Version>" | Set-Content BetterGenshinImpact/BetterGenshinImpact.csproj
       - name: 自动提交更改
-        if: github.repository_owner == 'babalae'
+        if: github.repository_owner == 'jiurag'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update version to ${{ needs.validate.outputs.version }}"
-          branch: main
+          branch: ${{ github.ref_name }}
           file_pattern: BetterGenshinImpact/BetterGenshinImpact.csproj
       - name: Cache NuGet packages
         uses: actions/cache@v4
@@ -114,7 +116,6 @@ jobs:
             ${{ runner.os }}-nuget-
       - name: 🛠️ Build application
         run: dotnet publish BetterGenshinImpact/BetterGenshinImpact.csproj -c Release -p:PublishProfile=FolderProfile -p:Version=${{ needs.validate.outputs.version }}
-        continue-on-error: true
       - name: 🧹 Clear & Move Files
         run: |
             $sourceDir = ".\BetterGenshinImpact\bin\x64\Release\net10.0-windows10.0.22621.0\publish\win-x64"
@@ -187,10 +188,20 @@ jobs:
         run: |
           cd dist
           7z a "BetterGI_v${{  needs.validate.outputs.version }}.7z" BetterGI -t7z -mx=5 -mf=BCJ2 -r -y
+          7z a "BetterGI_v${{  needs.validate.outputs.version }}.zip" BetterGI -tzip -mx=5 -r -y
+          $zipFile = "BetterGI_v${{  needs.validate.outputs.version }}.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipFile).Hash
+          "$hash *$zipFile" | Out-File -Encoding ascii -NoNewline "$zipFile.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: BetterGI_7z
           path: dist/BetterGI_*.7z
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BetterGI_Zip
+          path: |
+            dist/BetterGI_*.zip
+            dist/BetterGI_*.zip.sha256
 
   build_installer:
     runs-on: windows-latest
@@ -223,86 +234,20 @@ jobs:
           branch: main
           event: push
           workflow_conclusion: success
-      - name: 📥 Download last release
-        uses: robinraju/release-downloader@v1.8
-        with:
-          repository: "babalae/better-genshin-impact"
-          latest: true
-          fileName: "BetterGI_v*.7z"
-          out-file-path: 'last'
-      - name: 📥 Get 2nd and 3rd release
-        id: release_tags
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $releasesUrl = "https://api.github.com/repos/babalae/better-genshin-impact/releases"
-          $headers = @{
-              "Authorization" = "Bearer $env:GITHUB_TOKEN"
-              "Accept" = "application/vnd.github.v3+json"
-          }
-          $releases = Invoke-RestMethod -Uri $releasesUrl -Headers $headers -Method Get
-          $validReleases = $releases | 
-          Where-Object { -not $_.draft -and -not $_.prerelease } |
-          Sort-Object { [DateTime]$_.published_at } -Descending
-          if ($validReleases.Count -lt 3) {
-              Write-Error "至少需要 3 个正式 Release（当前找到 $($validReleases.Count) 个）"
-              exit 1
-          }
-          "second_release_tag=$($validReleases[1].tag_name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "third_release_tag=$($validReleases[2].tag_name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: 📥 Download 2nd last release
-        uses: robinraju/release-downloader@v1.8
-        with:
-          repository: "babalae/better-genshin-impact"
-          tag: ${{ steps.release_tags.outputs.second_release_tag }}
-          fileName: "BetterGI_v*.7z"
-          out-file-path: '2nd'
-      - name: 📥 Download 3rd last release
-        uses: robinraju/release-downloader@v1.8
-        with:
-          repository: "babalae/better-genshin-impact"
-          tag: ${{ steps.release_tags.outputs.third_release_tag }}
-          fileName: "BetterGI_v*.7z"
-          out-file-path: '3rd'
-      - name: Unpack releases
-        run: |
-          cd last
-          7z x "BetterGI*.7z" -otemp
-          if (Test-Path -Path ".\temp\BetterGI" -PathType Container) {
-              Move-Item -Path ".\temp\BetterGI" -Destination ".\BetterGI"
-          } else {
-              Rename-Item -Path ".\temp" -NewName ".\BetterGI"
-          }
-          cd ..
-          cd 2nd
-          7z x "BetterGI*.7z" -otemp
-          if (Test-Path -Path ".\temp\BetterGI" -PathType Container) {
-              Move-Item -Path ".\temp\BetterGI" -Destination ".\BetterGI"
-          } else {
-              Rename-Item -Path ".\temp" -NewName ".\BetterGI"
-          }
-          cd ..
-          cd 3rd
-          7z x "BetterGI*.7z" -otemp
-          if (Test-Path -Path ".\temp\BetterGI" -PathType Container) {
-              Move-Item -Path ".\temp\BetterGI" -Destination ".\BetterGI"
-          } else {
-              Rename-Item -Path ".\temp" -NewName ".\BetterGI"
-          }
-          cd ..
-          ls .\last
-          ls .\2nd
-          ls .\3rd
       - name: 📦 Pack kachina-builder
         run: |
           cd dist
-          ..\kachina-builder.exe gen -j 6 -i BetterGI -m metadata.json -o hashed -r babalae/bettergi -t ${{ needs.validate.outputs.version }} --diff-vers ..\last\BetterGI --diff-vers ..\2nd\BetterGI --diff-vers ..\3rd\BetterGI --diff-ignore *[.txt,.onnx] -u .\BetterGI\BetterGI.update.exe
+          ..\kachina-builder.exe gen -j 6 -i BetterGI -m metadata.json -o hashed -r jiurag/BetterGI_Fix -t ${{ needs.validate.outputs.version }} -u .\BetterGI\BetterGI.update.exe
           ..\kachina-builder.exe pack -c ../Build/kachina.config.json -m metadata.json -d hashed -o BetterGI.Install.${{ needs.validate.outputs.version }}.exe
+          $installerFile = "BetterGI.Install.${{ needs.validate.outputs.version }}.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installerFile).Hash
+          "$hash *$installerFile" | Out-File -Encoding ascii -NoNewline "$installerFile.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: BetterGI_Install
-          path: dist/BetterGI.Install.*.exe
+          path: |
+            dist/BetterGI.Install.*.exe
+            dist/BetterGI.Install.*.exe.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: BetterGI_OnlineInst
@@ -357,16 +302,18 @@ jobs:
           path: artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ needs.validate.outputs.version }}
+          tag_name: v${{ needs.validate.outputs.version }}
           name: BetterGI v${{ needs.validate.outputs.version }}
           draft: true
-          prerelease: ${{ contains(needs.validate.outputs.version, '-') }}
+          prerelease: ${{ github.repository_owner == 'babalae' && contains(needs.validate.outputs.version, '-') }}
           fail_on_unmatched_files: true
           files: |
-            artifacts/BetterGI_7z/*.7z
             artifacts/BetterGI_Install/*.exe
+            artifacts/BetterGI_Install/*.sha256
+            artifacts/BetterGI_Zip/*.zip
+            artifacts/BetterGI_Zip/*.sha256
 
   mirrorchyan_uploading:
     if: github.repository_owner == 'babalae' && contains(needs.validate.outputs.version, '-')
@@ -447,7 +394,7 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: '3.x'
       
@@ -540,7 +487,7 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: '3.x'
       

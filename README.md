@@ -6,7 +6,7 @@
 > - 本仓库：[`jiurag/BetterGI_Fix`](https://github.com/jiurag/BetterGI_Fix)
 > - 当前发布分支：`main`
 > - 上游项目：[`babalae/better-genshin-impact`](https://github.com/babalae/better-genshin-impact)
-> - 当前预发布版本：[`v0.66.3-alpha.1`](https://github.com/jiurag/BetterGI_Fix/releases/tag/v0.66.3-alpha.1)
+> - 当前预发布版本：[`v0.66.3-alpha.2`](https://github.com/jiurag/BetterGI_Fix/releases/tag/v0.66.3-alpha.2)
 
 BetterGI_Fix 基于 BetterGI 源码维护，保留上游的视觉识别、自动任务和模拟操作能力，并在本分支中增加原神帧率解锁与启动时全屏窗口化。
 
@@ -38,14 +38,14 @@ BetterGI_Fix 基于 BetterGI 源码维护，保留上游的视觉识别、自动
 
 前往[本分支的 Releases](https://github.com/jiurag/BetterGI_Fix/releases)下载最新预发布资产。
 
-1. 下载 `BetterGI_v*.zip`。
-2. 解压压缩包。
-3. 运行解压后 `BetterGI` 目录中的 `BetterGI.exe`。
+1. 下载 `BetterGI.Install.*.exe` 安装版，或 `BetterGI_v*.zip` 便携版。
+2. 安装版直接运行安装器并选择安装目录；便携版解压后运行 `BetterGI` 目录中的 `BetterGI.exe`。
+3. 安装或解压时请选择非系统盘目录，避免占用 C 盘空间。
 4. 打开首页的“原神，启动！”区域。
 5. 按需开启“启动时解锁帧率”和“启动时全屏窗口化”。
 6. 通过 BetterGI 启动原神。
 
-当前发布包为便携 ZIP，不包含安装器。`BetterGI.exe` 未进行数字签名，Windows SmartScreen 可能提示“未知发布者”。
+发布页同时提供安装器和便携 ZIP。`BetterGI.exe` 与安装器均未进行数字签名，Windows SmartScreen 可能提示“未知发布者”。
 
 ## 环境要求
 
