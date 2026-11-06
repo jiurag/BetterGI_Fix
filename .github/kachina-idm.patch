@@ -1,0 +1,1551 @@
+diff --git a/native/fs.rs b/native/fs.rs
+index 8cd0d82..cd93536 100644
+--- a/native/fs.rs
++++ b/native/fs.rs
+@@ -807,6 +807,15 @@ type HttpStream = (
+     Arc<Mutex<InsightItem>>,
+ );
+ 
++/// Validator values that let a resumed range prove it still belongs to the
++/// same remote object. The signed request URL is deliberately not included.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct RangeResponseMeta {
++    pub total_size: Option<u64>,
++    pub etag: Option<String>,
++    pub last_modified: Option<String>,
++}
++
+ pub async fn create_http_stream(
+     url: &str,
+     offset: usize,
+@@ -816,7 +825,7 @@ pub async fn create_http_stream(
+ ) -> TAResult<HttpStream> {
+     let reading = crate::ipc::network::Reading::begin();
+     let permit = crate::ipc::download::request().await?;
+-    open_http_stream(
++    let (stream, length, insight, _) = open_http_stream(
+         url,
+         offset,
+         size,
+@@ -825,7 +834,8 @@ pub async fn create_http_stream(
+         reading,
+         permit,
+     )
+-    .await
++    .await?;
++    Ok((stream, length, insight))
+ }
+ 
+ /// Opens a package range whose URL the session resolves. The request slot is
+@@ -837,6 +847,24 @@ pub async fn create_resolved_stream(
+     skip_decompress: bool,
+     request_range: Option<&str>,
+ ) -> TAResult<HttpStream> {
++    let (stream, length, insight, _) =
++        create_resolved_stream_with_meta(offset, size, skip_decompress, request_range).await?;
++    Ok((stream, length, insight))
++}
++
++/// Like [`create_resolved_stream`], but also returns response validators used
++/// by persistent range downloads to reject stale partial files.
++pub async fn create_resolved_stream_with_meta(
++    offset: usize,
++    size: usize,
++    skip_decompress: bool,
++    request_range: Option<&str>,
++) -> TAResult<(
++    Box<dyn AsyncRead + Unpin + Send>,
++    u64,
++    Arc<Mutex<InsightItem>>,
++    RangeResponseMeta,
++)> {
+     let reading = crate::ipc::network::Reading::begin();
+     let permit = crate::ipc::download::request().await?;
+     let url = crate::ipc::download::resolve(offset as u64, size as u64).await?;
+@@ -860,7 +888,12 @@ async fn open_http_stream(
+     request_range: Option<&str>,
+     reading: crate::ipc::network::Reading,
+     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+-) -> TAResult<HttpStream> {
++) -> TAResult<(
++    Box<dyn AsyncRead + Unpin + Send>,
++    u64,
++    Arc<Mutex<InsightItem>>,
++    RangeResponseMeta,
++)> {
+     let request_start_time = Instant::now();
+     let has_range = size > 0;
+     let insight_range = insight_range_vec(request_range, offset, size);
+@@ -918,6 +951,7 @@ async fn open_http_stream(
+     if has_range {
+         validate_range_response(&res, offset as u64, size as u64)?;
+     }
++    let range_meta = range_response_meta(&res);
+     let exact_length = res.content_length();
+     let stream = res.bytes_stream();
+     let reader = tokio_util::io::StreamReader::new(stream.map_err(std::io::Error::other));
+@@ -937,13 +971,41 @@ async fn open_http_stream(
+         crate::ipc::network::Reader::new(insight_stream, reading, permit, exact_length);
+ 
+     if skip_decompress {
+-        Ok((Box::new(insight_stream), content_length, insight_handle))
++        Ok((
++            Box::new(insight_stream),
++            content_length,
++            insight_handle,
++            range_meta,
++        ))
+     } else {
+         // 在NetworkInsightStream外层套一个BufReader，然后再解压缩
+         let buf_reader = BufReader::new(insight_stream);
+         let decompressed = TokioZstdDecoder::new(buf_reader);
+         // ✅ 关键：即使被解压缩包装，insight_handle仍然可用！
+-        Ok((Box::new(decompressed), content_length, insight_handle))
++        Ok((
++            Box::new(decompressed),
++            content_length,
++            insight_handle,
++            range_meta,
++        ))
++    }
++}
++
++fn range_response_meta(response: &reqwest::Response) -> RangeResponseMeta {
++    let header = |name: &str| {
++        response
++            .headers()
++            .get(name)
++            .and_then(|value| value.to_str().ok())
++            .map(str::to_owned)
++    };
++    let total_size = header("content-range")
++        .and_then(|value| value.rsplit_once('/').map(|(_, total)| total.to_owned()))
++        .and_then(|total| total.parse().ok());
++    RangeResponseMeta {
++        total_size,
++        etag: header("etag"),
++        last_modified: header("last-modified"),
+     }
+ }
+ 
+diff --git a/native/fs/staging.rs b/native/fs/staging.rs
+index fcc6743..8f14ccd 100644
+--- a/native/fs/staging.rs
++++ b/native/fs/staging.rs
+@@ -265,6 +265,10 @@ impl Staging {
+         self.root.join("dl")
+     }
+ 
++    pub fn resume_dir(&self) -> PathBuf {
++        self.dl_dir().join("resume")
++    }
++
+     pub fn journal_path(&self) -> PathBuf {
+         self.root.join(JOURNAL)
+     }
+@@ -314,9 +318,11 @@ impl Staging {
+         if !has_journal {
+             // The lock must be owned before stale contents are removed. A
+             // second opener may have observed the same empty root earlier.
+-            for dir in [staging.new_dir(), staging.old_dir(), staging.dl_dir()] {
++            for dir in [staging.new_dir(), staging.old_dir()] {
+                 remove_tree(&dir);
+             }
++            clear_download_scratch(&staging.dl_dir());
++            crate::ipc::download::prune_resume(&staging.dl_dir());
+             let _ = std::fs::remove_file(staging.journal_path());
+             staging.ensure_layout()?;
+             // The staging root inherits from the install directory's parent,
+@@ -344,7 +350,12 @@ impl Staging {
+     }
+ 
+     pub fn ensure_layout(&self) -> anyhow::Result<()> {
+-        for dir in [self.new_dir(), self.old_dir(), self.dl_dir()] {
++        for dir in [
++            self.new_dir(),
++            self.old_dir(),
++            self.dl_dir(),
++            self.resume_dir(),
++        ] {
+             std::fs::create_dir_all(&dir)
+                 .with_context(|| format!("create {}", dir.display()))
+                 .attach(TEMP_DIR_UNAVAILABLE)?;
+@@ -433,6 +444,25 @@ pub fn remove_tree(path: &Path) {
+     }
+ }
+ 
++/// Remove one-run download scratch while retaining resumable ranges.
++fn clear_download_scratch(dl_dir: &Path) {
++    let Ok(entries) = std::fs::read_dir(dl_dir) else {
++        return;
++    };
++    for entry in entries.flatten() {
++        if entry.file_name() == "resume" {
++            continue;
++        }
++        if entry.path().is_dir() {
++            remove_tree(&entry.path());
++        } else if let Err(err) = std::fs::remove_file(entry.path()) {
++            if err.kind() != std::io::ErrorKind::NotFound {
++                tracing::warn!("remove {} failed: {err}", entry.path().display());
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -600,6 +630,35 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&base);
+     }
+ 
++    #[test]
++    fn open_keeps_resumable_downloads_and_removes_scratch() {
++        let base = tmp();
++        let install = base.join("resume-app");
++        let install_s = install.to_string_lossy().to_string();
++        let root = temp_candidate(&install_s);
++        std::fs::create_dir_all(root.join("dl").join("resume").join("content-key")).unwrap();
++        std::fs::write(
++            root.join("dl")
++                .join("resume")
++                .join("content-key")
++                .join("0-99.partial"),
++            b"keep",
++        )
++        .unwrap();
++        std::fs::write(root.join("dl").join("old-runtime.exe"), b"remove").unwrap();
++
++        let opened = Staging::open(&install_s, false).unwrap();
++        assert!(opened
++            .staging
++            .resume_dir()
++            .join("content-key")
++            .join("0-99.partial")
++            .exists());
++        assert!(!opened.staging.dl_dir().join("old-runtime.exe").exists());
++        opened.staging.discard();
++        let _ = std::fs::remove_dir_all(&base);
++    }
++
+     #[test]
+     fn open_refuses_live_lock() {
+         let base = tmp();
+diff --git a/native/ipc/download.rs b/native/ipc/download.rs
+index 421de9a..d1ee5df 100644
+--- a/native/ipc/download.rs
++++ b/native/ipc/download.rs
+@@ -3,14 +3,18 @@
+ use serde::{Deserialize, Serialize};
+ use std::{
+     collections::HashMap,
++    path::{Path, PathBuf},
+     sync::{
+         atomic::{AtomicBool, AtomicUsize, Ordering},
+         Arc, LazyLock, Mutex,
+     },
++    time::{Duration, SystemTime, UNIX_EPOCH},
+ };
+ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+ use tokio_util::sync::CancellationToken;
+ 
++use crate::fs::RangeResponseMeta;
++
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+ pub struct Config {
+     pub id: String,
+@@ -39,6 +43,7 @@ pub struct Session {
+     pub cancel: CancellationToken,
+     pub disk: Arc<Semaphore>,
+     pub dl_dir: String,
++    concurrency: usize,
+     large: Arc<Semaphore>,
+     small: Arc<Semaphore>,
+     first: [AtomicUsize; 2],
+@@ -57,6 +62,8 @@ pub struct Context {
+ type Waiters = HashMap<String, oneshot::Sender<Result<String, String>>>;
+ static SESSIONS: LazyLock<Mutex<HashMap<String, Arc<Session>>>> = LazyLock::new(Default::default);
+ static WAITERS: LazyLock<Mutex<Waiters>> = LazyLock::new(Default::default);
++static RESUME_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
++    LazyLock::new(Default::default);
+ tokio::task_local! {
+     pub static CURRENT: Context;
+     pub static RESOLVER: mpsc::UnboundedSender<(Resolve, bool)>;
+@@ -86,6 +93,7 @@ pub fn begin(config: Config) {
+             cancel: CancellationToken::new(),
+             disk: Arc::new(Semaphore::new(config.prefetch_bytes.min(256 * 1024 * 1024))),
+             dl_dir: config.dl_dir,
++            concurrency: config.concurrency.clamp(1, 16),
+             large,
+             small,
+             first: Default::default(),
+@@ -230,10 +238,17 @@ pub async fn finish(ctx: &Context, success: bool) -> anyhow::Result<()> {
+ }
+ 
+ struct PartFile {
+-    file: super::install_file::TemporaryFile,
++    path: PathBuf,
++    _temporary: Option<super::install_file::TemporaryFile>,
+     _space: OwnedSemaphorePermit,
+ }
+ 
++impl PartFile {
++    fn path(&self) -> &Path {
++        &self.path
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub(super) struct SharedError(pub(super) Arc<anyhow::Error>);
+ impl std::fmt::Display for SharedError {
+@@ -249,8 +264,11 @@ impl std::error::Error for SharedError {
+ async fn open_part(
+     offset: u64,
+     len: u64,
+-) -> anyhow::Result<Box<dyn tokio::io::AsyncRead + Unpin + Send>> {
+-    match crate::fs::create_resolved_stream(
++) -> anyhow::Result<(
++    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
++    RangeResponseMeta,
++)> {
++    match crate::fs::create_resolved_stream_with_meta(
+         usize::try_from(offset)?,
+         usize::try_from(len)?,
+         true,
+@@ -258,9 +276,9 @@ async fn open_part(
+     )
+     .await
+     {
+-        Ok((reader, _, insight)) => {
++        Ok((reader, _, insight, meta)) => {
+             CURRENT.with(|ctx| ctx.insights.lock().unwrap().push(insight));
+-            Ok(reader)
++            Ok((reader, meta))
+         }
+         Err(err) => {
+             if let Some(insight) = err.insight {
+@@ -282,22 +300,28 @@ fn local_error(error: std::io::Error) -> anyhow::Error {
+     anyhow::Error::new(error).attach(code)
+ }
+ 
+-async fn prefetch(offset: u64, len: u64, space: OwnedSemaphorePermit) -> anyhow::Result<PartFile> {
++async fn prefetch_temporary(
++    offset: u64,
++    len: u64,
++    space: OwnedSemaphorePermit,
++) -> anyhow::Result<PartFile> {
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+     let dir = CURRENT.with(|c| c.session.dl_dir.clone());
++    let temporary = super::install_file::TemporaryFile(
++        Path::new(&dir).join(format!("{}.part", uuid::Uuid::new_v4())),
++    );
+     let part = PartFile {
+-        file: super::install_file::TemporaryFile(
+-            std::path::Path::new(&dir).join(format!("{}.part", uuid::Uuid::new_v4())),
+-        ),
++        path: temporary.path().to_path_buf(),
++        _temporary: Some(temporary),
+         _space: space,
+     };
+     for attempt in 0..2 {
+-        let mut file = tokio::fs::File::create(part.file.path())
++        let mut file = tokio::fs::File::create(part.path())
+             .await
+             .map_err(local_error)?;
+         let input = open_part(offset, len).await;
+         let mut reader = match input {
+-            Ok(reader) => reader,
++            Ok((reader, _)) => reader,
+             Err(err) if attempt == 0 && !CURRENT.with(|c| c.stop.is_cancelled()) => {
+                 tracing::debug!("range retry: {err:#}");
+                 continue;
+@@ -335,7 +359,335 @@ async fn prefetch(offset: u64, len: u64, space: OwnedSemaphorePermit) -> anyhow:
+     unreachable!()
+ }
+ 
+-pub fn sliced(parts: Vec<(u64, u64)>) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
++const RESUME_VERSION: u8 = 1;
++const RESUME_MANIFEST_INTERVAL: u64 = 4 * 1024 * 1024;
++const RESUME_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
++
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++struct ResumeManifest {
++    version: u8,
++    key: String,
++    start: u64,
++    len: u64,
++    have: u64,
++    total_size: Option<u64>,
++    etag: Option<String>,
++    last_modified: Option<String>,
++    updated: u64,
++}
++
++#[derive(Debug)]
++struct ResumePaths {
++    dir: PathBuf,
++    partial: PathBuf,
++    complete: PathBuf,
++    manifest: PathBuf,
++}
++
++impl ResumePaths {
++    fn new(dir: &Path, key: &str, offset: u64, len: u64) -> Self {
++        let stem = format!("{}-{}", offset, offset + len - 1);
++        let dir = dir.join("resume").join(key);
++        Self {
++            partial: dir.join(format!("{stem}.partial")),
++            complete: dir.join(format!("{stem}.part")),
++            manifest: dir.join(format!("{stem}.json")),
++            dir,
++        }
++    }
++}
++
++fn valid_resume_key(key: &str) -> bool {
++    !key.is_empty()
++        && key.len() <= 64
++        && key
++            .bytes()
++            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
++}
++
++fn updated_at() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_secs()
++}
++
++fn write_resume_manifest(path: &Path, manifest: &ResumeManifest) -> std::io::Result<()> {
++    let bytes = serde_json::to_vec(manifest).map_err(std::io::Error::other)?;
++    let temporary = path.with_extension("json.tmp");
++    std::fs::write(&temporary, bytes)?;
++    if path.exists() {
++        std::fs::remove_file(path)?;
++    }
++    std::fs::rename(temporary, path)
++}
++
++fn read_resume_manifest(path: &Path, key: &str, offset: u64, len: u64) -> Option<ResumeManifest> {
++    let text = std::fs::read(path).ok()?;
++    let manifest: ResumeManifest = serde_json::from_slice(&text).ok()?;
++    (manifest.version == RESUME_VERSION
++        && manifest.key == key
++        && manifest.start == offset
++        && manifest.len == len
++        && manifest.have <= len)
++        .then_some(manifest)
++}
++
++fn remote_matches(old: &ResumeManifest, current: &RangeResponseMeta) -> bool {
++    if let (Some(old_etag), Some(current_etag)) = (&old.etag, &current.etag) {
++        return old_etag == current_etag;
++    }
++    if let (Some(old_time), Some(current_time)) = (&old.last_modified, &current.last_modified) {
++        return old_time == current_time;
++    }
++    if let (Some(old_size), Some(current_size)) = (old.total_size, current.total_size) {
++        return old_size == current_size;
++    }
++    true
++}
++
++fn remove_resume_part(paths: &ResumePaths) {
++    let _ = std::fs::remove_file(&paths.partial);
++    let _ = std::fs::remove_file(&paths.complete);
++    let _ = std::fs::remove_file(&paths.manifest);
++}
++
++async fn resume_lock(path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
++    let lock = RESUME_LOCKS
++        .lock()
++        .unwrap()
++        .entry(path.to_path_buf())
++        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
++        .clone();
++    lock.lock_owned().await
++}
++
++fn file_len(path: &Path) -> anyhow::Result<Option<u64>> {
++    match std::fs::metadata(path) {
++        Ok(meta) => Ok(Some(meta.len())),
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
++        Err(err) => Err(local_error(err)),
++    }
++}
++
++async fn prefetch_resumable(
++    offset: u64,
++    len: u64,
++    key: String,
++    space: OwnedSemaphorePermit,
++) -> anyhow::Result<PartFile> {
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++
++    let dl_dir = CURRENT.with(|c| c.session.dl_dir.clone());
++    let paths = ResumePaths::new(Path::new(&dl_dir), &key, offset, len);
++    let _lock = resume_lock(&paths.partial).await;
++    tokio::fs::create_dir_all(&paths.dir)
++        .await
++        .map_err(local_error)?;
++
++    let mut manifest = read_resume_manifest(&paths.manifest, &key, offset, len);
++    // A complete range needs no network. Final file hashing still protects
++    // against unvalidated same-size changes at the server.
++    if file_len(&paths.complete)?.is_some_and(|size| size == len) && manifest.is_some() {
++        return Ok(PartFile {
++            path: paths.complete,
++            _temporary: None,
++            _space: space,
++        });
++    }
++    if file_len(&paths.complete)?.is_some() {
++        remove_resume_part(&paths);
++        manifest = None;
++    }
++    if let Some(size) = file_len(&paths.partial)? {
++        if manifest.is_none() || size > len {
++            remove_resume_part(&paths);
++            manifest = None;
++        } else if size == len {
++            tokio::fs::rename(&paths.partial, &paths.complete)
++                .await
++                .map_err(local_error)?;
++            return Ok(PartFile {
++                path: paths.complete,
++                _temporary: None,
++                _space: space,
++            });
++        }
++    } else if manifest.is_some() {
++        manifest = None;
++        remove_resume_part(&paths);
++    }
++
++    let mut restart_used = false;
++    for attempt in 0..3 {
++        let mut have = file_len(&paths.partial)?.unwrap_or(0);
++        if have == len {
++            tokio::fs::rename(&paths.partial, &paths.complete)
++                .await
++                .map_err(local_error)?;
++            return Ok(PartFile {
++                path: paths.complete,
++                _temporary: None,
++                _space: space,
++            });
++        }
++
++        let remaining = len - have;
++        let (mut reader, response_meta) = match open_part(offset + have, remaining).await {
++            Ok(opened) => opened,
++            Err(err) if attempt < 2 && !CURRENT.with(|c| c.stop.is_cancelled()) => {
++                tracing::debug!("resume range retry: {err:#}");
++                continue;
++            }
++            Err(err) => return Err(err),
++        };
++
++        if have > 0 {
++            let stale = manifest
++                .as_ref()
++                .is_some_and(|old| !remote_matches(old, &response_meta));
++            if stale {
++                tracing::info!("remote range changed; discarding stale partial download");
++                remove_resume_part(&paths);
++                manifest = None;
++                if restart_used {
++                    return Err(anyhow::anyhow!("remote range changed repeatedly"));
++                }
++                restart_used = true;
++                continue;
++            }
++        }
++
++        let current = ResumeManifest {
++            version: RESUME_VERSION,
++            key: key.clone(),
++            start: offset,
++            len,
++            have,
++            total_size: response_meta.total_size,
++            etag: response_meta.etag.clone(),
++            last_modified: response_meta.last_modified.clone(),
++            updated: updated_at(),
++        };
++        write_resume_manifest(&paths.manifest, &current).map_err(local_error)?;
++        manifest = Some(current);
++
++        let mut file = tokio::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(&paths.partial)
++            .await
++            .map_err(local_error)?;
++        let mut buffer = vec![0; 64 * 1024];
++        let mut since_manifest = 0u64;
++        let outcome = loop {
++            match reader.read(&mut buffer).await {
++                Ok(0) => {
++                    break if have == len {
++                        Ok(())
++                    } else {
++                        Err(anyhow::anyhow!("incomplete range body"))
++                    }
++                }
++                Ok(n) => {
++                    have += n as u64;
++                    anyhow::ensure!(have <= len, "range body exceeds declared length");
++                    file.write_all(&buffer[..n]).await.map_err(local_error)?;
++                    since_manifest += n as u64;
++                    if since_manifest >= RESUME_MANIFEST_INTERVAL {
++                        file.flush().await.map_err(local_error)?;
++                        let mut updated = manifest.clone().unwrap();
++                        updated.have = have;
++                        updated.updated = updated_at();
++                        write_resume_manifest(&paths.manifest, &updated).map_err(local_error)?;
++                        manifest = Some(updated);
++                        since_manifest = 0;
++                    }
++                }
++                Err(err) => break Err(err.into()),
++            }
++        };
++        file.flush().await.map_err(local_error)?;
++        drop(file);
++
++        let mut updated = manifest.clone().unwrap();
++        updated.have = have;
++        updated.updated = updated_at();
++        let _ = write_resume_manifest(&paths.manifest, &updated);
++        match outcome {
++            Ok(()) => {
++                tokio::fs::rename(&paths.partial, &paths.complete)
++                    .await
++                    .map_err(local_error)?;
++                return Ok(PartFile {
++                    path: paths.complete,
++                    _temporary: None,
++                    _space: space,
++                });
++            }
++            Err(err) if attempt < 2 && !CURRENT.with(|c| c.stop.is_cancelled()) => {
++                tracing::debug!("resumable range interrupted at {have}/{len}: {err:#}");
++            }
++            Err(err) => return Err(err),
++        }
++    }
++    Err(anyhow::anyhow!("range retry limit reached"))
++}
++
++async fn prefetch(
++    offset: u64,
++    len: u64,
++    resume_key: Option<String>,
++    space: OwnedSemaphorePermit,
++) -> anyhow::Result<PartFile> {
++    match resume_key.filter(|key| valid_resume_key(key)) {
++        Some(key) => prefetch_resumable(offset, len, key, space).await,
++        None => prefetch_temporary(offset, len, space).await,
++    }
++}
++
++/// Removes all persisted ranges for the supplied stable keys. Called only when
++/// the finished output fails validation, so known-good partials are retained
++/// across cancellation and network failures.
++pub fn discard_resume(keys: &[String]) {
++    let Ok(dl_dir) = CURRENT.try_with(|ctx| ctx.session.dl_dir.clone()) else {
++        return;
++    };
++    for key in keys.iter().filter(|key| valid_resume_key(key)) {
++        let dir = Path::new(&dl_dir).join("resume").join(key);
++        if let Err(err) = std::fs::remove_dir_all(&dir) {
++            if err.kind() != std::io::ErrorKind::NotFound {
++                tracing::warn!("remove resume {} failed: {err}", dir.display());
++            }
++        }
++    }
++}
++
++pub fn prune_resume(dl_dir: &Path) {
++    let root = dl_dir.join("resume");
++    let Ok(entries) = std::fs::read_dir(&root) else {
++        return;
++    };
++    let oldest = SystemTime::now().checked_sub(RESUME_MAX_AGE);
++    for entry in entries.flatten() {
++        let path = entry.path();
++        let expired = oldest.is_some_and(|limit| {
++            entry
++                .metadata()
++                .and_then(|meta| meta.modified())
++                .map(|modified| modified < limit)
++                .unwrap_or(true)
++        });
++        if expired {
++            let _ = std::fs::remove_dir_all(path);
++        }
++    }
++}
++
++pub fn sliced(
++    parts: Vec<(u64, u64)>,
++    resume_key: Option<String>,
++) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
+     let (tx, rx) = mpsc::channel::<std::io::Result<bytes::Bytes>>(2);
+     let worker = spawn(async move {
+         use tokio::io::AsyncReadExt;
+@@ -348,27 +700,70 @@ pub fn sliced(parts: Vec<(u64, u64)>) -> Box<dyn tokio::io::AsyncRead + Unpin +
+         let mut pending: HashMap<usize, tokio::task::JoinHandle<anyhow::Result<PartFile>>> =
+             HashMap::new();
+         let result: anyhow::Result<()> = async {
++            if resume_key.is_some() {
++                for ahead in 0..parts.len().min(ctx.session.concurrency) {
++                    let (offset, len) = parts[ahead];
++                    let space = if pending.is_empty() {
++                        tokio::select! {
++                            _ = ctx.stop.cancelled() => return Err(crate::utils::code::Cancelled.into()),
++                            permit = ctx.session.disk.clone().acquire_many_owned(len.try_into()?) => permit?,
++                        }
++                    } else {
++                        match ctx.session.disk.clone().try_acquire_many_owned(len.try_into()?) {
++                            Ok(permit) => permit,
++                            Err(_) => break,
++                        }
++                    };
++                    let waiting = queued[ahead].take();
++                    let resume_key = resume_key.clone();
++                    pending.insert(ahead, spawn(async move {
++                        let result = prefetch(offset, len, resume_key, space).await;
++                        drop(waiting);
++                        result
++                    }));
++                }
++            }
+             for index in 0..parts.len() {
+                 let (offset, len) = parts[index];
++                if resume_key.is_some() && !pending.contains_key(&index) {
++                    let space = tokio::select! {
++                        _ = ctx.stop.cancelled() => return Err(crate::utils::code::Cancelled.into()),
++                        permit = ctx.session.disk.clone().acquire_many_owned(len.try_into()?) => permit?,
++                    };
++                    let waiting = queued[index].take();
++                    let key = resume_key.clone();
++                    pending.insert(index, spawn(async move {
++                        let result = prefetch(offset, len, key, space).await;
++                        drop(waiting);
++                        result
++                    }));
++                }
+                 let part = match pending.remove(&index) { Some(task) => Some(task.await??), None => None };
+                 let network_pending = queued[index].take();
+                 let mut retried = false;
+                 let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if let Some(part) = &part {
+-                    Box::new(tokio::fs::File::open(part.file.path()).await?)
++                    Box::new(tokio::fs::File::open(part.path()).await?)
+                 } else {
+                     match open_part(offset, len).await {
+-                        Ok(reader) => reader,
+-                        Err(_) if !ctx.stop.is_cancelled() => { retried = true; open_part(offset, len).await? },
++                        Ok((reader, _)) => reader,
++                        Err(_) if !ctx.stop.is_cancelled() => {
++                            retried = true;
++                            open_part(offset, len).await?.0
++                        }
+                         Err(err) => return Err(err),
+                     }
+                 };
+-                for ahead in index + 1..parts.len().min(index + 3) {
+-                    if pending.contains_key(&ahead) { continue; }
++                let window_end = parts.len().min(index + 1 + ctx.session.concurrency);
++                for ahead in index + 1..window_end {
++                    if pending.contains_key(&ahead) {
++                        continue;
++                    }
+                     let (offset, len) = parts[ahead];
+                     if let Ok(space) = ctx.session.disk.clone().try_acquire_many_owned(len.try_into()?) {
+                         let waiting = queued[ahead].take();
++                        let resume_key = resume_key.clone();
+                         pending.insert(ahead, spawn(async move {
+-                            let result = prefetch(offset, len, space).await;
++                            let result = prefetch(offset, len, resume_key, space).await;
+                             drop(waiting);
+                             result
+                         }));
+@@ -381,7 +776,7 @@ pub fn sliced(parts: Vec<(u64, u64)>) -> Box<dyn tokio::io::AsyncRead + Unpin +
+                     if (read.is_err() || matches!(read, Ok(0))) && received == 0 && part.is_none() && !retried && !ctx.stop.is_cancelled() {
+                         drop(reader);
+                         retried = true;
+-                        reader = open_part(offset, len).await?;
++                        reader = open_part(offset, len).await?.0;
+                         continue;
+                     }
+                     let n = read?;
+@@ -426,8 +821,494 @@ pub fn sliced(parts: Vec<(u64, u64)>) -> Box<dyn tokio::io::AsyncRead + Unpin +
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use std::sync::atomic::AtomicU64;
+     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+ 
++    struct RangeServer {
++        url: String,
++        data: Arc<Mutex<Vec<u8>>>,
++        etag: Arc<Mutex<String>>,
++        requests: Arc<Mutex<Vec<(usize, usize)>>>,
++        interrupt: Arc<AtomicBool>,
++        delay_millis: Arc<AtomicU64>,
++        max_active: Arc<AtomicUsize>,
++        task: tokio::task::JoinHandle<()>,
++    }
++
++    impl RangeServer {
++        async fn start(data: Vec<u8>) -> Self {
++            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let url = format!("http://{}/package", listener.local_addr().unwrap());
++            let data = Arc::new(Mutex::new(data));
++            let etag = Arc::new(Mutex::new("\"v1\"".to_string()));
++            let requests = Arc::new(Mutex::new(Vec::new()));
++            let interrupt = Arc::new(AtomicBool::new(true));
++            let delay_millis = Arc::new(AtomicU64::new(0));
++            let active = Arc::new(AtomicUsize::new(0));
++            let max_active = Arc::new(AtomicUsize::new(0));
++            let task = {
++                let data = data.clone();
++                let etag = etag.clone();
++                let requests = requests.clone();
++                let interrupt = interrupt.clone();
++                let delay_millis = delay_millis.clone();
++                let active = active.clone();
++                let max_active = max_active.clone();
++                tokio::spawn(async move {
++                    loop {
++                        let (mut socket, _) = listener.accept().await.unwrap();
++                        let data = data.clone();
++                        let etag = etag.clone();
++                        let requests = requests.clone();
++                        let interrupt = interrupt.clone();
++                        let delay_millis = delay_millis.clone();
++                        let active = active.clone();
++                        let max_active = max_active.clone();
++                        tokio::spawn(async move {
++                            let now = active.fetch_add(1, Ordering::Relaxed) + 1;
++                            max_active.fetch_max(now, Ordering::Relaxed);
++                            let mut header = Vec::new();
++                            while !header.ends_with(b"\r\n\r\n") {
++                                let Ok(byte) = socket.read_u8().await else {
++                                    active.fetch_sub(1, Ordering::Relaxed);
++                                    return;
++                                };
++                                header.push(byte);
++                            }
++                            let header = String::from_utf8(header).unwrap().to_lowercase();
++                            let range = header
++                                .lines()
++                                .find_map(|line| line.strip_prefix("range: bytes="))
++                                .unwrap();
++                            let (start, end) = range.split_once('-').unwrap();
++                            let start: usize = start.parse().unwrap();
++                            let end: usize = end.parse().unwrap();
++                            requests.lock().unwrap().push((start, end));
++                            let data = data.lock().unwrap().clone();
++                            let header = format!(
++                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\nETag: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
++                                data.len(),
++                                end - start + 1,
++                                etag.lock().unwrap()
++                            );
++                            socket.write_all(header.as_bytes()).await.unwrap();
++                            let send_end = if interrupt.load(Ordering::Relaxed) {
++                                end.min(start + 8191)
++                            } else {
++                                end
++                            };
++                            let delay = delay_millis.load(Ordering::Relaxed);
++                            if delay == 0 {
++                                let _ = socket.write_all(&data[start..=send_end]).await;
++                            } else {
++                                for chunk in data[start..=send_end].chunks(16 * 1024) {
++                                    if socket.write_all(chunk).await.is_err() {
++                                        break;
++                                    }
++                                    tokio::time::sleep(Duration::from_millis(delay)).await;
++                                }
++                            }
++                            active.fetch_sub(1, Ordering::Relaxed);
++                        });
++                    }
++                })
++            };
++            Self {
++                url,
++                data,
++                etag,
++                requests,
++                interrupt,
++                delay_millis,
++                max_active,
++                task,
++            }
++        }
++    }
++
++    impl Drop for RangeServer {
++        fn drop(&mut self) {
++            self.task.abort();
++        }
++    }
++
++    async fn run_sliced_session(
++        dir: &Path,
++        url: &str,
++        parts: &[crate::session::download_plan::Range],
++        resume_key: &str,
++        target: &Path,
++        md5: Option<String>,
++    ) -> anyhow::Result<()> {
++        let id = uuid::Uuid::new_v4().to_string();
++        begin(Config {
++            id: id.clone(),
++            concurrency: 16,
++            dl_dir: dir.to_string_lossy().into_owned(),
++            prefetch_bytes: 256 * 1024 * 1024,
++        });
++        let ctx = context(
++            &Job {
++                session: id.clone(),
++                large: true,
++            },
++            true,
++        )
++        .unwrap();
++        let (tx, mut rx) = mpsc::unbounded_channel::<(Resolve, bool)>();
++        let url = url.to_string();
++        let resolver = tokio::spawn(async move {
++            while let Some((query, _)) = rx.recv().await {
++                reply(Reply {
++                    id: query.id,
++                    url: Ok(url.clone()),
++                });
++            }
++        });
++        let args = super::super::install_file::InstallFileArgs {
++            mode: super::super::install_file::InstallFileMode::Direct(
++                super::super::install_file::InstallFileSource::Sliced {
++                    parts: parts.iter().map(|part| (part.start, part.len)).collect(),
++                    resume_key: Some(resume_key.to_string()),
++                    skip_decompress: false,
++                },
++            ),
++            target: target.to_string_lossy().into_owned(),
++            output_size: 0,
++            old: None,
++            md5,
++            xxh: None,
++            clear_installer_index_mark: None,
++        };
++        let result = tokio::time::timeout(
++            Duration::from_secs(15),
++            RESOLVER.scope(
++                tx,
++                CURRENT.scope(
++                    ctx.clone(),
++                    super::super::network::measure(super::super::progress_noop(), |notify| {
++                        super::super::install_file::ipc_install_file(args, notify)
++                    }),
++                ),
++            ),
++        )
++        .await
++        .expect("download session timed out");
++        let success = result.0.is_ok();
++        if success {
++            finish(&ctx, true).await.unwrap();
++        } else {
++            let _ = finish(&ctx, false).await;
++        }
++        end(&id);
++        resolver.abort();
++        let (result, _) = result;
++        result.map(|_| ()).map_err(anyhow::Error::from)
++    }
++
++    #[tokio::test]
++    async fn resumable_ranges_survive_restart_and_resume_from_disk() {
++        let mut seed = 27u64;
++        let data: Vec<u8> = (0..700_000)
++            .map(|_| {
++                seed ^= seed << 13;
++                seed ^= seed >> 7;
++                seed ^= seed << 17;
++                seed as u8
++            })
++            .collect();
++        let packed = zstd::encode_all(data.as_slice(), 1).unwrap();
++        let len = packed.len() as u64;
++        let parts = crate::session::download_plan::Policy {
++            upper: len / 5,
++            maximum: len / 4,
++            ..Default::default()
++        }
++        .split(crate::session::download_plan::Range { start: 0, len });
++        assert!(parts.len() >= 4);
++
++        let server = RangeServer::start(packed).await;
++        let dir = std::env::temp_dir().join(format!("kachina-resume-{}", uuid::Uuid::new_v4()));
++        tokio::fs::create_dir_all(&dir).await.unwrap();
++        let first = run_sliced_session(
++            &dir,
++            &server.url,
++            &parts,
++            "stable-content-key",
++            &dir.join("first-output"),
++            None,
++        )
++        .await;
++        assert!(first.is_err());
++        assert!(server.requests.lock().unwrap().len() >= parts.len().min(3));
++        assert!(
++            std::fs::read_dir(dir.join("resume").join("stable-content-key"))
++                .unwrap()
++                .any(|entry| entry
++                    .unwrap()
++                    .path()
++                    .extension()
++                    .is_some_and(|ext| ext == "partial"))
++        );
++
++        server.interrupt.store(false, Ordering::Relaxed);
++        let before: Vec<_> = server.requests.lock().unwrap().clone();
++        let second = run_sliced_session(
++            &dir,
++            &server.url,
++            &parts,
++            "stable-content-key",
++            &dir.join("second-output"),
++            None,
++        )
++        .await;
++        second.unwrap();
++        assert_eq!(
++            tokio::fs::read(dir.join("second-output")).await.unwrap(),
++            data
++        );
++        let after = server.requests.lock().unwrap().clone();
++        assert!(after[before.len()..]
++            .iter()
++            .any(|(start, _)| parts.iter().any(|part| *start as u64 > part.start)));
++        assert!(server.max_active.load(Ordering::Relaxed) >= 2);
++
++        tokio::fs::remove_dir_all(dir).await.unwrap();
++    }
++
++    const PROCESS_STAGE_ENV: &str = "KACHINA_RESUME_PROCESS_STAGE";
++    const PROCESS_DIR_ENV: &str = "KACHINA_RESUME_PROCESS_DIR";
++    const PROCESS_URL_ENV: &str = "KACHINA_RESUME_PROCESS_URL";
++    const PROCESS_TARGET_ENV: &str = "KACHINA_RESUME_PROCESS_TARGET";
++    const PROCESS_RESUME_KEY: &str = "process-restart-key";
++
++    fn process_fixture() -> (Vec<u8>, Vec<u8>, Vec<crate::session::download_plan::Range>) {
++        let mut seed = 71u64;
++        let data: Vec<u8> = (0..5_000_000)
++            .map(|_| {
++                seed ^= seed << 13;
++                seed ^= seed >> 7;
++                seed ^= seed << 17;
++                seed as u8
++            })
++            .collect();
++        let packed = zstd::encode_all(data.as_slice(), 1).unwrap();
++        let len = packed.len() as u64;
++        let parts = crate::session::download_plan::Policy {
++            upper: len / 8,
++            maximum: len / 5,
++            ..Default::default()
++        }
++        .split(crate::session::download_plan::Range { start: 0, len });
++        (data, packed, parts)
++    }
++
++    fn resume_process_command(dir: &Path, url: &str, target: &Path) -> std::process::Command {
++        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
++        command
++            .arg("--exact")
++            .arg("ipc::download::tests::resumable_ranges_survive_process_kill")
++            .arg("--nocapture")
++            .env(PROCESS_STAGE_ENV, "child")
++            .env(PROCESS_DIR_ENV, dir)
++            .env(PROCESS_URL_ENV, url)
++            .env(PROCESS_TARGET_ENV, target)
++            .stdout(std::process::Stdio::piped())
++            .stderr(std::process::Stdio::piped());
++        command
++    }
++
++    fn process_has_partial(dir: &Path) -> bool {
++        let root = dir.join("resume").join(PROCESS_RESUME_KEY);
++        std::fs::read_dir(root)
++            .ok()
++            .into_iter()
++            .flatten()
++            .flatten()
++            .any(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
++    }
++
++    async fn wait_for_process_partial(dir: &Path) {
++        for _ in 0..400 {
++            if process_has_partial(dir) {
++                // Windows may not publish a growing file's length through the
++                // directory until the writer closes. Leave enough time for a
++                // few chunks to reach disk, then terminate the child process.
++                tokio::time::sleep(Duration::from_millis(200)).await;
++                return;
++            }
++            tokio::time::sleep(Duration::from_millis(5)).await;
++        }
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn resumable_ranges_survive_process_kill() {
++        let (data, packed, parts) = process_fixture();
++        if std::env::var_os(PROCESS_STAGE_ENV).is_some() {
++            let dir = PathBuf::from(std::env::var_os(PROCESS_DIR_ENV).unwrap());
++            let url = std::env::var(PROCESS_URL_ENV).unwrap();
++            let target = PathBuf::from(std::env::var_os(PROCESS_TARGET_ENV).unwrap());
++            run_sliced_session(&dir, &url, &parts, PROCESS_RESUME_KEY, &target, None)
++                .await
++                .unwrap();
++            return;
++        }
++
++        let server = RangeServer::start(packed).await;
++        server.interrupt.store(false, Ordering::Relaxed);
++        server.delay_millis.store(50, Ordering::Relaxed);
++        let dir =
++            std::env::temp_dir().join(format!("kachina-process-resume-{}", uuid::Uuid::new_v4()));
++        tokio::fs::create_dir_all(&dir).await.unwrap();
++        let target = dir.join("process-output");
++
++        let mut first = resume_process_command(&dir, &server.url, &target)
++            .spawn()
++            .unwrap();
++        wait_for_process_partial(&dir).await;
++        if !process_has_partial(&dir) {
++            let _ = first.kill();
++            let first_output = first.wait_with_output().unwrap();
++            panic!(
++                "first process never persisted a meaningful partial range\nstdout:\n{}\nstderr:\n{}",
++                String::from_utf8_lossy(&first_output.stdout),
++                String::from_utf8_lossy(&first_output.stderr)
++            );
++        }
++        let _ = first.kill();
++        let first_output = first.wait_with_output().unwrap();
++        assert!(!first_output.status.success());
++        assert!(process_has_partial(&dir));
++
++        server.delay_millis.store(0, Ordering::Relaxed);
++        tokio::time::sleep(Duration::from_millis(100)).await;
++        let before = server.requests.lock().unwrap().len();
++        let second_output = resume_process_command(&dir, &server.url, &target)
++            .spawn()
++            .unwrap()
++            .wait_with_output()
++            .unwrap();
++        assert!(
++            second_output.status.success(),
++            "resume process failed\nstdout:\n{}\nstderr:\n{}",
++            String::from_utf8_lossy(&second_output.stdout),
++            String::from_utf8_lossy(&second_output.stderr)
++        );
++
++        assert_eq!(tokio::fs::read(&target).await.unwrap(), data);
++        let requests = server.requests.lock().unwrap().clone();
++        assert!(
++            requests[before..]
++                .iter()
++                .any(|(start, _)| parts.iter().any(|part| *start as u64 > part.start)),
++            "second process did not resume any range from a nonzero offset"
++        );
++        assert!(
++            server.max_active.load(Ordering::Relaxed) >= 5,
++            "range prefetch did not use the session's large-range network slots"
++        );
++
++        tokio::fs::remove_dir_all(dir).await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn changed_remote_object_discards_stale_partial() {
++        let mut old_seed = 41u64;
++        let old: Vec<u8> = (0..500_000)
++            .map(|_| {
++                old_seed ^= old_seed << 13;
++                old_seed ^= old_seed >> 7;
++                old_seed ^= old_seed << 17;
++                old_seed as u8
++            })
++            .collect();
++        let mut seed = 91u64;
++        let new: Vec<u8> = (0..old.len())
++            .map(|_| {
++                seed ^= seed << 13;
++                seed ^= seed >> 7;
++                seed ^= seed << 17;
++                seed as u8
++            })
++            .collect();
++        let old_packed = zstd::encode_all(old.as_slice(), 1).unwrap();
++        let new_packed = zstd::encode_all(new.as_slice(), 1).unwrap();
++        let len = old_packed.len() as u64;
++        let parts = crate::session::download_plan::Policy {
++            upper: len / 3,
++            maximum: len / 2,
++            ..Default::default()
++        }
++        .split(crate::session::download_plan::Range { start: 0, len });
++        let server = RangeServer::start(old_packed).await;
++        let dir = std::env::temp_dir().join(format!("kachina-changing-{}", uuid::Uuid::new_v4()));
++        tokio::fs::create_dir_all(&dir).await.unwrap();
++        assert!(run_sliced_session(
++            &dir,
++            &server.url,
++            &parts,
++            "same-content-key",
++            &dir.join("first-output"),
++            None,
++        )
++        .await
++        .is_err());
++
++        *server.data.lock().unwrap() = new_packed;
++        *server.etag.lock().unwrap() = "\"v2\"".to_string();
++        server.interrupt.store(false, Ordering::Relaxed);
++        server.requests.lock().unwrap().clear();
++        run_sliced_session(
++            &dir,
++            &server.url,
++            &parts,
++            "same-content-key",
++            &dir.join("second-output"),
++            None,
++        )
++        .await
++        .unwrap();
++        assert_eq!(
++            tokio::fs::read(dir.join("second-output")).await.unwrap(),
++            new
++        );
++        let starts: Vec<_> = server
++            .requests
++            .lock()
++            .unwrap()
++            .iter()
++            .map(|(start, _)| *start)
++            .collect();
++        assert!(starts.iter().any(|start| *start > 0));
++        assert!(starts.iter().filter(|start| **start == 0).count() >= 1);
++        tokio::fs::remove_dir_all(dir).await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn hash_failure_discards_finished_ranges() {
++        let data = vec![0x42; 100_000];
++        let packed = zstd::encode_all(data.as_slice(), 1).unwrap();
++        let len = packed.len() as u64;
++        let parts = [crate::session::download_plan::Range { start: 0, len }];
++        let server = RangeServer::start(packed).await;
++        server.interrupt.store(false, Ordering::Relaxed);
++        let dir = std::env::temp_dir().join(format!("kachina-hash-fail-{}", uuid::Uuid::new_v4()));
++        tokio::fs::create_dir_all(&dir).await.unwrap();
++        assert!(run_sliced_session(
++            &dir,
++            &server.url,
++            &parts,
++            "bad-hash-key",
++            &dir.join("output"),
++            Some("00000000000000000000000000000000".to_string()),
++        )
++        .await
++        .is_err());
++        assert!(!dir.join("resume").join("bad-hash-key").exists());
++        assert!(!dir.join("output").exists());
++        tokio::fs::remove_dir_all(dir).await.unwrap();
++    }
++
+     // 合成不可压缩数据使分片跨越 Zstd 帧内部；中间片断流一次，覆盖落盘重试。
+     #[tokio::test]
+     async fn sliced_zstd_retries_range_and_cleans_prefetch() {
+@@ -515,6 +1396,7 @@ mod tests {
+             mode: super::super::install_file::InstallFileMode::Direct(
+                 super::super::install_file::InstallFileSource::Sliced {
+                     parts: parts.iter().map(|p| (p.start, p.len)).collect(),
++                    resume_key: None,
+                     skip_decompress: false,
+                 },
+             ),
+diff --git a/native/ipc/install_file.rs b/native/ipc/install_file.rs
+index 7ef7f44..e0c9768 100644
+--- a/native/ipc/install_file.rs
++++ b/native/ipc/install_file.rs
+@@ -43,6 +43,9 @@ pub struct MultichunkResult {
+ pub enum InstallFileSource {
+     Sliced {
+         parts: Vec<(u64, u64)>,
++        /// Stable content-derived identity used by persistent range downloads.
++        #[serde(default)]
++        resume_key: Option<String>,
+         skip_decompress: bool,
+     },
+     Url {
+@@ -90,6 +93,16 @@ impl InstallFileSource {
+             _ => unreachable!("merged member is not a single package range"),
+         }
+     }
++
++    fn resume_keys(&self) -> Vec<String> {
++        match self {
++            Self::Sliced {
++                resume_key: Some(key),
++                ..
++            } => vec![key.clone()],
++            _ => Vec::new(),
++        }
++    }
+ }
+ 
+ #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+@@ -136,6 +149,19 @@ impl InstallFileMode {
+             } => *diff_size as u64 + *base_size,
+         }
+     }
++
++    fn resume_keys(&self) -> Vec<String> {
++        match self {
++            Self::Direct(source) | Self::Patch { source, .. } => source.resume_keys(),
++            Self::HybridPatch { diff, source, .. } => {
++                let mut keys = diff.resume_keys();
++                keys.extend(source.resume_keys());
++                keys.sort();
++                keys.dedup();
++                keys
++            }
++        }
++    }
+ }
+ 
+ #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
+@@ -175,6 +201,7 @@ async fn finalize_staged(args: &InstallFileArgs, target: &Path, reporter: &Repor
+     .await;
+     if res.is_err() {
+         let _ = tokio::fs::remove_file(target).await;
++        super::download::discard_resume(&args.mode.resume_keys());
+     }
+     res
+ }
+@@ -252,15 +279,22 @@ async fn create_stream_by_source(
+     match source {
+         InstallFileSource::Sliced {
+             parts,
++            resume_key,
+             skip_decompress,
+         } => {
+             if let [(offset, len)] = parts.as_slice() {
+-                let (reader, _, insight) =
+-                    create_resolved_stream(*offset as usize, *len as usize, skip_decompress, None)
+-                        .await?;
+-                return Ok((reader, Some(insight)));
++                if resume_key.is_none() {
++                    let (reader, _, insight) = create_resolved_stream(
++                        *offset as usize,
++                        *len as usize,
++                        skip_decompress,
++                        None,
++                    )
++                    .await?;
++                    return Ok((reader, Some(insight)));
++                }
+             }
+-            let reader = super::download::sliced(parts);
++            let reader = super::download::sliced(parts, resume_key);
+             let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = if skip_decompress {
+                 reader
+             } else {
+diff --git a/native/session/run.rs b/native/session/run.rs
+index 4c1fb6d..8def4c2 100644
+--- a/native/session/run.rs
++++ b/native/session/run.rs
+@@ -843,12 +843,17 @@ async fn commit_staged(
+     Ok(outcome.self_replaced)
+ }
+ 
+-/// End-of-session staging cleanup: the directory outlives the process only
+-/// when it parks the running executable.
+-async fn finish_staging(staged: &SessionStaging, self_replaced: bool, mgr: &ManagedElevate) {
+-    if self_replaced {
++/// End-of-session staging cleanup. Failed and cancelled sessions retain the
++/// staging root so `dl\resume` can continue on the next launch.
++async fn finish_staging(
++    staged: &SessionStaging,
++    self_replaced: bool,
++    completed: bool,
++    mgr: &ManagedElevate,
++) {
++    if completed && self_replaced {
+         schedule_cleanup(mgr, staged.elevate, staged.root()).await;
+-    } else {
++    } else if completed {
+         staged.discard(mgr).await;
+     }
+ }
+@@ -1347,7 +1352,8 @@ async fn run_dfs_install(
+     )
+     .await;
+     let self_replaced = recovered_self || matches!(result, Ok((_, true)));
+-    finish_staging(&staged, self_replaced, mgr).await;
++    let completed = matches!(&result, Ok((result, _)) if !result.cancelled);
++    finish_staging(&staged, self_replaced, completed, mgr).await;
+     result.map(|(r, _)| r)
+ }
+ 
+@@ -2657,30 +2663,36 @@ async fn install_merged(
+ ) -> anyhow::Result<MergedResult> {
+     let chunks: Vec<InstallFileArgs> = files
+         .iter()
+-        .map(|file| InstallFileArgs {
+-            mode: {
+-                let source = InstallFileSource::Sliced {
+-                    parts: vec![(file.offset as u64, file.size as u64)],
+-                    skip_decompress: false,
+-                };
+-                if let Some(patch) = &file.patch {
+-                    InstallFileMode::Patch {
+-                        source,
+-                        diff_size: patch.size as usize,
++        .map(|file| {
++            let parts = vec![(file.offset as u64, file.size as u64)];
++            let resume_key =
++                hash_of_item(&file.item, hash_key).map(|hash| download_resume_key(&hash, &parts));
++            InstallFileArgs {
++                mode: {
++                    let source = InstallFileSource::Sliced {
++                        parts,
++                        resume_key,
++                        skip_decompress: false,
++                    };
++                    if let Some(patch) = &file.patch {
++                        InstallFileMode::Patch {
++                            source,
++                            diff_size: patch.size as usize,
++                        }
++                    } else {
++                        InstallFileMode::Direct(source)
+                     }
+-                } else {
+-                    InstallFileMode::Direct(source)
+-                }
+-            },
+-            output_size: file.item.size,
+-            target: staged_target(staging, &file.item.file_name),
+-            old: file
+-                .patch
+-                .as_ref()
+-                .map(|_| join_install(&settings.install_path, &file.item.file_name)),
+-            md5: file.item.md5.clone(),
+-            xxh: file.item.xxh.clone(),
+-            clear_installer_index_mark: None,
++                },
++                output_size: file.item.size,
++                target: staged_target(staging, &file.item.file_name),
++                old: file
++                    .patch
++                    .as_ref()
++                    .map(|_| join_install(&settings.install_path, &file.item.file_name)),
++                md5: file.item.md5.clone(),
++                xxh: file.item.xxh.clone(),
++                clear_installer_index_mark: None,
++            }
+         })
+         .collect();
+     let ipc = IpcOperation::InstallMultichunkStream(InstallMultiStreamArgs {
+@@ -2857,14 +2869,17 @@ async fn resolve_install_source(
+         } else {
+             vec![range]
+         };
++        let part_specs: Vec<_> = parts.iter().map(|part| (part.start, part.len)).collect();
+         return Ok(InstallFileSource::Sliced {
+-            parts: parts.into_iter().map(|p| (p.start, p.len)).collect(),
++            resume_key: Some(download_resume_key(hash, &part_specs)),
++            parts: part_specs,
+             skip_decompress: false,
+         });
+     }
+     if installer && ctx.has_dfs2_session() && ctx.installer_end > 0 {
+         return Ok(InstallFileSource::Sliced {
+             parts: vec![(0, ctx.installer_end as u64)],
++            resume_key: None,
+             skip_decompress: true,
+         });
+     }
+@@ -2873,6 +2888,21 @@ async fn resolve_install_source(
+     ))
+ }
+ 
++/// Stable range-download identity. Signed URLs and temporary staging paths are
++/// intentionally excluded, so a later launch can find the same partial range.
++fn download_resume_key(content_hash: &str, parts: &[(u64, u64)]) -> String {
++    use sha2::Digest;
++    let mut digest = sha2::Sha256::new();
++    digest.update(b"kachina-resume-v1\n");
++    digest.update(content_hash.as_bytes());
++    for (start, len) in parts {
++        digest.update(b"\n");
++        digest.update(start.to_le_bytes());
++        digest.update(len.to_le_bytes());
++    }
++    hex::encode(&digest.finalize()[..16])
++}
++
+ fn side_hash(side: &crate::utils::metadata::PatchSide, key: HashKey) -> Option<&str> {
+     match key {
+         HashKey::Md5 => side.md5.as_deref(),
+@@ -3318,7 +3348,7 @@ async fn run_mirrorc(
+     };
+     if version_name == current_version {
+         tracing::info!("already latest, tag={version_name}");
+-        finish_staging(&staged, recovered_self, mgr).await;
++        finish_staging(&staged, recovered_self, true, mgr).await;
+         finish_install(
+             settings,
+             config,
+@@ -3346,15 +3376,15 @@ async fn run_mirrorc(
+         false,
+     );
+     if !prepare_process(settings, project, ui, mgr, &version_name).await? {
+-        finish_staging(&staged, recovered_self, mgr).await;
++        finish_staging(&staged, recovered_self, false, mgr).await;
+         return Ok(SessionResult::cancelled(settings.is_update));
+     }
+     if ui.check_cancel().is_err() {
+-        finish_staging(&staged, recovered_self, mgr).await;
++        finish_staging(&staged, recovered_self, false, mgr).await;
+         return Err(anyhow::Error::new(Cancelled));
+     }
+     let (Some(url), Some(sha256)) = (url, sha256) else {
+-        finish_staging(&staged, recovered_self, mgr).await;
++        finish_staging(&staged, recovered_self, false, mgr).await;
+         return Err(anyhow::Error::from(Coded::bare(MIRRORC_FAILED)));
+     };
+     tracing::info!("Mirrorc URL {url}");
+@@ -3372,7 +3402,8 @@ async fn run_mirrorc(
+     )
+     .await;
+     let self_replaced = recovered_self || matches!(result, Ok((_, true)));
+-    finish_staging(&staged, self_replaced, mgr).await;
++    let completed = matches!(&result, Ok((result, _)) if !result.cancelled);
++    finish_staging(&staged, self_replaced, completed, mgr).await;
+     result.map(|(r, _)| r)
+ }
+ 
