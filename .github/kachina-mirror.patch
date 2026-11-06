@@ -1,0 +1,53 @@
+diff --git a/native/session/plugin.rs b/native/session/plugin.rs
+index a1dddc6..c9c1e00 100644
+--- a/native/session/plugin.rs
++++ b/native/session/plugin.rs
+@@ -110,6 +110,7 @@ fn parse_github_url(url: &str) -> anyhow::Result<GitHubUrl> {
+         .unwrap_or_else(|| (url.to_string(), None));
+     let mut version_regex = None;
+     let mut cache_time = None;
++    let mut version_uri = None;
+     if let Some(params) = params {
+         let parsed = url::Url::parse(&format!("https://dummy.local/?{params}"))
+             .map_err(|e| attach_metadata(e.into()))?;
+@@ -123,6 +124,7 @@ fn parse_github_url(url: &str) -> anyhow::Result<GitHubUrl> {
+                         }
+                     }
+                 }
++                "versionUri" => version_uri = Some(v.into_owned()),
+                 _ => {}
+             }
+         }
+@@ -131,7 +133,7 @@ fn parse_github_url(url: &str) -> anyhow::Result<GitHubUrl> {
+         anyhow::anyhow!("URL must contain /releases/").attach(crate::utils::code::SOURCE_INVALID)
+     })?;
+     let releases_prefix = format!("{}{}", &base_url[..releases_index], "/releases");
+-    let releases_latest_url = format!("{releases_prefix}/latest");
++    let releases_latest_url = version_uri.unwrap_or_else(|| format!("{releases_prefix}/latest"));
+     let (owner, repo) = owner_repo_from_releases_url(&base_url).ok_or_else(|| {
+         anyhow::anyhow!("Invalid releases URL format").attach(crate::utils::code::SOURCE_INVALID)
+     })?;
+@@ -296,6 +299,23 @@ mod tests {
+         assert_eq!(repo, "app");
+     }
+ 
++    #[test]
++    fn proxy_source_can_resolve_version_from_official_release_page() {
++        let parsed = parse_github_url(
++            "https://proxy.example/https://github.com/YuehaiTeam/app/releases/download/${version}/foo.exe?bgiMirror=1#versionUri=https%3A%2F%2Fgithub.com%2FYuehaiTeam%2Fapp%2Freleases%2Flatest",
++        )
++        .unwrap();
++
++        assert_eq!(
++            parsed.releases_latest_url,
++            "https://github.com/YuehaiTeam/app/releases/latest"
++        );
++        assert_eq!(
++            parsed.base_url,
++            "https://proxy.example/https://github.com/YuehaiTeam/app/releases/download/${version}/foo.exe?bgiMirror=1"
++        );
++    }
++
+     #[test]
+     fn tag_from_latest_redirect() {
+         assert_eq!(
